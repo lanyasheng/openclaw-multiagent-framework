@@ -1,12 +1,14 @@
 """
 completion_listener.py — Monitors task-log.jsonl for completed/failed tasks and dispatches alerts.
 
-v2: Reads completion status directly from task-log.jsonl (written by spawn-interceptor
-subagent_ended hook), instead of polling a relay session. This is more reliable because
-subagent_ended is a system event that fires regardless of agent behavior.
+v2.3 compatible: Reads completion events from task-log.jsonl, which is written by:
+  - spawn-interceptor's subagent_ended hook (runtime=subagent, <1s latency)
+  - spawn-interceptor's ACP Session Poller (runtime=acp, ~15s latency)
+  - spawn-interceptor's Stale Reaper (any runtime stuck >30min)
+  - task-callback-bus WatcherBus (runtime=external, adapter-driven)
 
-Also checks the completion-relay session for explicit notifications from ACP agents
-(best-effort enhancement — agents may or may not send these).
+This listener doesn't care about the completion source — it just reads task-log.jsonl
+as the single source of truth for all task lifecycle events.
 
 Usage:
     python completion_listener.py --once           # single check
