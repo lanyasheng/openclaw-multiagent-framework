@@ -1,98 +1,80 @@
 /**
- * spawn-interceptor — OpenClaw plugin that automatically tracks task spawns
- * and injects completion relay instructions into ACP prompts.
+ * spawn-interceptor — OpenClaw plugin for automatic ACP task tracking.
  *
- * Solves: "Agent forgets to register watcher" by making registration automatic.
+ * Uses two hooks:
+ *   1. before_tool_call: intercepts sessions_spawn to inject completion relay
+ *   2. subagent_ended: logs completion when sub-agents finish
  *
- * Hook: before_tool_call
- * Intercepted tools: sessions_spawn
+ * Install: copy to ~/.openclaw/plugins/spawn-interceptor/
+ * Config:  add "spawn-interceptor" to plugins.allow in openclaw.json
  */
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const TASK_LOG_PATH = path.join(
-  os.homedir(),
-  '.openclaw',
-  'shared-context',
-  'monitor-tasks',
-  'task-log.jsonl'
-);
-
+const SHARED_CTX = path.join(os.homedir(), '.openclaw', 'shared-context');
+const TASK_LOG = path.join(SHARED_CTX, 'monitor-tasks', 'task-log.jsonl');
 const COMPLETION_SESSION = 'agent:main:completion-relay';
 
-function generateTaskId() {
+function genId() {
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `tsk_${ts}_${rand}`;
+  const r = Math.random().toString(36).slice(2, 8);
+  return `tsk_${ts}_${r}`;
 }
 
-function appendTaskLog(entry) {
-  const dir = path.dirname(TASK_LOG_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  fs.appendFileSync(TASK_LOG_PATH, JSON.stringify(entry) + '\n');
+function log(entry) {
+  const dir = path.dirname(TASK_LOG);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(TASK_LOG, JSON.stringify(entry) + '\n');
 }
 
-function buildCompletionRelay(taskId, agentId) {
+function relay(taskId) {
   return `
 
 ---
-[COMPLETION RELAY — DO NOT REMOVE]
-When you have finished ALL work on this task, you MUST execute the following
-as your FINAL action before ending:
-
-Use the sessions_send tool with these exact parameters:
+[COMPLETION RELAY]
+When ALL work is done, execute sessions_send with:
   sessionKey: "${COMPLETION_SESSION}"
-  message: A JSON object with these fields:
-    - type: "acp_completion"
-    - taskId: "${taskId}"
-    - status: "completed" or "failed"
-    - summary: A one-sentence summary of what you accomplished
-    - error: If failed, the reason (otherwise omit)
-
-This notification is critical. Without it, the requester will never know
-your task finished.
+  message: JSON with fields:
+    type: "acp_completion"
+    taskId: "${taskId}"
+    status: "completed" or "failed"
+    summary: one-sentence result
 ---`;
 }
 
-const hooks = {
-  before_tool_call: async (event) => {
-    const { toolName, params, agentId, sessionKey } = event;
+module.exports = {
+  hooks: {
+    before_tool_call(event, ctx) {
+      if (event.toolName !== 'sessions_spawn') return;
 
-    if (toolName !== 'sessions_spawn') {
-      return {};
+      const p = event.params || {};
+      const id = genId();
+      const rt = p.runtime || 'subagent';
+
+      log({
+        taskId: id,
+        agentId: ctx.agentId || '?',
+        sessionKey: ctx.sessionKey || '',
+        runtime: rt,
+        task: String(p.task || '').slice(0, 200),
+        spawnedAt: new Date().toISOString(),
+        status: 'spawning'
+      });
+
+      if (rt === 'acp' && p.task) {
+        return { params: { ...p, task: p.task + relay(id) } };
+      }
+    },
+
+    subagent_ended(event, ctx) {
+      log({
+        event: 'subagent_ended',
+        childSessionKey: event.childSessionKey || '?',
+        agentId: ctx.agentId || '?',
+        endedAt: new Date().toISOString()
+      });
     }
-
-    const taskId = generateTaskId();
-    const runtime = params.runtime || 'subagent';
-    const taskSummary = (params.task || '').substring(0, 200);
-
-    appendTaskLog({
-      taskId,
-      agentId: agentId || 'unknown',
-      sessionKey: sessionKey || '',
-      runtime,
-      task: taskSummary,
-      spawnedAt: new Date().toISOString(),
-      status: 'spawning',
-      completionReceived: false
-    });
-
-    if (runtime === 'acp' && params.task) {
-      const relay = buildCompletionRelay(taskId, agentId);
-      return {
-        params: {
-          ...params,
-          task: params.task + relay
-        }
-      };
-    }
-
-    return {};
   }
 };
-
-module.exports = { hooks };
