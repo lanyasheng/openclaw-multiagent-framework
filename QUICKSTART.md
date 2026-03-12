@@ -35,7 +35,7 @@ mkdir -p ~/.openclaw/shared-context/{job-status,monitor-tasks,dispatches,intel,f
 ### 步骤 2：复制框架文档（1 分钟）
 
 ```bash
-cp -r ~/.openclaw/shared-context/openclaw-multiantent-framework/* \
+cp -r ~/.openclaw/repos/openclaw-multiagent-framework/* \
       ~/.openclaw/shared-context/
 ```
 
@@ -193,6 +193,8 @@ echo "   - 通知记录: ~/.openclaw/shared-context/monitor-tasks/notifications/
 chmod +x test-framework.sh
 ./test-framework.sh
 ```
+
+> **注意**：此脚本引用内部实现路径（`~/.openclaw/workspace/skills/task_callback_bus/`）。开源用户需自行实现 `register_generic_task.py` 或参考 [INTERNAL_VS_OSS.md](INTERNAL_VS_OSS.md) 了解差异。
 
 ---
 

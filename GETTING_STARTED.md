@@ -330,6 +330,7 @@ MVP (第 1 周) → 习惯养成 (第 2-3 周) → 自动化 (第 4 周+)
    ```bash
    bash scripts/test-framework.sh
    ```
+   > **注意**：此脚本为内部实现示例，开源用户需参考 [QUICKSTART.md](QUICKSTART.md) 自行实现。
 
 2. **阅读完整协议**：深入理解 `AGENT_PROTOCOL.md`
 

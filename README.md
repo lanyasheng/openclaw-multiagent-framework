@@ -48,14 +48,11 @@ cp -r * ~/.openclaw/shared-context/
 # 3. 创建必要目录
 mkdir -p ~/.openclaw/shared-context/{job-status,monitor-tasks,dispatches,intel,followups}
 
-# 4. 运行测试任务验证
-bash scripts/test-framework.sh
-
-# 5. 向团队发送协议通知
-# (使用 sessions_send 通知所有 Agent)
+# 4. 阅读接入指引，了解 MVP 与进阶能力
+open GETTING_STARTED.md
 ```
 
-详细指南见 [QUICKSTART.md](QUICKSTART.md)。
+详细部署指南见 [QUICKSTART.md](QUICKSTART.md) 和 [GETTING_STARTED.md](GETTING_STARTED.md)。
 
 ---
 
@@ -64,13 +61,13 @@ bash scripts/test-framework.sh
 | 文档 | 用途 | 阅读顺序 |
 |------|------|----------|
 | `README.md` | 框架说明（本文档） | 1 |
-| `QUICKSTART.md` | 15 分钟快速部署指南 | 2 |
-| `AGENT_PROTOCOL.md` | 完整协议规范 | 3 |
-| `ARCHITECTURE.md` | 架构设计和技术细节 | 4 |
-| `TEMPLATES.md` | 消息和文件模板 | 5 |
-| `CAPABILITY_LAYERS.md` | 能力分层表 (L1/L2/L3) | 6 |
-| `INTERNAL_VS_OSS.md` | 开源包 vs 内部运行版差异 | 7 |
-| `GETTING_STARTED.md` | 接入指引（MVP / 进阶集合） | 8 |
+| `GETTING_STARTED.md` | 接入指引（MVP / 进阶集合） | 2 |
+| `QUICKSTART.md` | 15 分钟快速部署指南 | 3 |
+| `INTERNAL_VS_OSS.md` | 开源包 vs 内部运行版差异 | 4 |
+| `AGENT_PROTOCOL.md` | 完整协议规范 | 5 |
+| `ARCHITECTURE.md` | 架构设计和技术细节 | 6 |
+| `TEMPLATES.md` | 消息和文件模板 | 7 |
+| `CAPABILITY_LAYERS.md` | 能力分层表 (L1/L2/L3) | 8 |
 | `CONTRIBUTING.md` | 贡献方式与提交流程 | 9 |
 
 ---
@@ -250,6 +247,7 @@ bash scripts/test-framework.sh
 ```text
 openclaw-multiagent-framework/
 ├── README.md
+├── RELEASE_NOTES.md
 ├── QUICKSTART.md
 ├── GETTING_STARTED.md
 ├── INTERNAL_VS_OSS.md
