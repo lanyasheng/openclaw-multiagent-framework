@@ -239,7 +239,7 @@ python3 examples/completion-relay/completion_listener.py --loop --interval 30
 | [#34054](https://github.com/openclaw/openclaw/issues/34054) | Gateway 不对已完成的 oneshot 会话调用 `runtime.close()` | 僵尸会话触达 `maxConcurrentSessions` 限制 | Guardian 脚本每日 GC |
 | [#35886](https://github.com/openclaw/openclaw/issues/35886) | ACP 子进程在 TTL 后未被清理 | 僵尸进程堆积 | Guardian 健康检查自动重启 |
 | [#40272](https://github.com/openclaw/openclaw/issues/40272) | ACP 的 `notifyChannel` 不生效 | 无原生完成通知 | spawn-interceptor 插件 |
-| （未文档化） | `subagent_ended` hook 不对 ACP runtime 触发 | ACP 任务状态永远停留在 `spawning` | v2.3 ACP Session Poller |
+| （未文档化） | `subagent_ended` hook 不对 ACP runtime 触发 | ACP 任务状态永远停留在 `spawning` | v2.4 ACP Session Poller |
 
 ---
 
@@ -263,7 +263,7 @@ python3 examples/completion-relay/completion_listener.py --loop --interval 30
 ```
 ├── plugins/
 │   └── spawn-interceptor/        # OpenClaw 插件 (~250 行)
-│       ├── index.js              # v2.3: hooks + ACP poller + stale reaper
+│       ├── index.js              # v2.4: hooks + ACP poller + stale reaper
 │       ├── package.json          # 插件元数据
 │       └── openclaw.plugin.json  # OpenClaw 插件清单
 ├── examples/

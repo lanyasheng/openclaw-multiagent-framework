@@ -240,7 +240,7 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 | [#34054](https://github.com/openclaw/openclaw/issues/34054) | Gateway doesn't call `runtime.close()` for completed oneshot sessions | Zombie sessions hit `maxConcurrentSessions` limit | Daily GC in Guardian script |
 | [#35886](https://github.com/openclaw/openclaw/issues/35886) | ACP child processes not cleaned after TTL | Zombie process accumulation | Guardian health-check auto-restart |
 | [#40272](https://github.com/openclaw/openclaw/issues/40272) | `notifyChannel` doesn't work in ACP | No native completion notification | spawn-interceptor plugin |
-| (undocumented) | `subagent_ended` hook doesn't fire for ACP runtime | ACP task status stuck at `spawning` | v2.3 ACP Session Poller |
+| (undocumented) | `subagent_ended` hook doesn't fire for ACP runtime | ACP task status stuck at `spawning` | v2.4 ACP Session Poller |
 
 ---
 
@@ -264,7 +264,7 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 ```
 ├── plugins/
 │   └── spawn-interceptor/        # OpenClaw plugin (~250 lines)
-│       ├── index.js              # v2.3: hooks + ACP poller + stale reaper
+│       ├── index.js              # v2.4: hooks + ACP poller + stale reaper
 │       ├── package.json          # Plugin metadata
 │       └── openclaw.plugin.json  # OpenClaw plugin manifest
 ├── examples/
