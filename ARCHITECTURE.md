@@ -39,7 +39,7 @@
 
 **特点**：
 - 适用于 >10 秒的长任务
-- `spawn-interceptor` 自动拦截 `sessions_spawn` 并记录到 task-log
+- `spawn-interceptor` 自动拦截 `sessions_spawn` 并记录到 task-log（v2.3: 含 ACP session poller）
 - ACP 任务自动注入完成回调，完成时通过 `sessions_send` 回推结果
 - `completion-listener` 处理通知并更新 task-log 状态
 
@@ -97,9 +97,11 @@ sequenceDiagram
     P->>P: hook 拦截: 记录 task-log + 注入回调
     M->>ACP: ACP 启动（含回调指令）
     note over ACP: 异步执行任务
-    ACP->>ACP: sessions_send(completion)
+    ACP->>ACP: 任务完成 → acpx session closed
+    note over P: ACP session poller (15s interval)
+    P->>P: 检测 ~/.acpx/sessions/ closed=true
+    P->>P: 更新 task-log (completed)
     L->>L: 监听 task-log.jsonl 新完成记录
-    L->>L: 更新 task-log 状态
     L->>U: 通知（stdout/Discord/Telegram）
 ```
 

@@ -2,6 +2,33 @@
 
 ---
 
+## v2.3.0 — ACP Session Poller: 真正的完成检测闭环 (2026-03-13)
+
+### 核心发现
+
+**`subagent_ended` hook 不对 ACP runtime 生效**。之前 v2.2 假设 `subagent_ended` 是 PRIMARY 完成检测机制，但实际测试表明 OpenClaw 的该 hook 仅对 `runtime=subagent` 触发，ACP session 结束时不会触发。这导致所有 ACP 任务永远卡在 `spawning` 状态。
+
+### 新增: ACP Session Poller
+
+- 每 15 秒轮询 `~/.acpx/sessions/index.json`
+- 通过 `created_at` 时间窗口匹配（±60s）将 acpx session 关联到 pending task
+- 检测到 session `closed: true` 后，自动标记任务为 `completed`
+- 如果任务超过 2 分钟且所有 ACP session 都已关闭，执行批量清理
+
+### 三层完成检测防御
+
+| 层级 | 机制 | 覆盖场景 | 延迟 |
+|------|------|----------|------|
+| L1 | `subagent_ended` hook | `runtime=subagent` 正常完成/失败 | <1s |
+| L2 | ACP session poller | `runtime=acp` session 关闭 | ~15s |
+| L3 | Stale reaper | 任何 runtime 超过 30min | 30min |
+
+### 验证结果
+- 模拟测试: 注入 pending ACP 任务 + 已关闭 acpx session → 启动时立即检测到完成（match=0s）
+- 历史回溯: 之前卡住的真实 ACP 任务也被正确标记为 completed（match=9s）
+
+---
+
 ## v2.2.0 — Completion 回传修复 + 防御增强 (2026-03-13)
 
 ### 核心修复
@@ -15,9 +42,10 @@
 ### 防御机制
 | 场景 | 防御 |
 |------|------|
-| 正常完成 | subagent_ended hook → completed |
+| subagent 正常完成 | subagent_ended hook → completed |
+| ACP 完成 | ~~subagent_ended~~ **v2.3: ACP session poller** → completed |
 | Gateway 断开 | 持久化恢复 + stale reaper → timeout |
-| ACP 崩溃 | subagent_ended(reason=error) → failed |
+| ACP 崩溃 | ~~subagent_ended~~ **v2.3: ACP session poller** → completed |
 
 ### 已知 OpenClaw Bug
 新增 Bug 追踪章节：#34054, #35886, #40243, #40272

@@ -1,16 +1,15 @@
 /**
- * spawn-interceptor — OpenClaw plugin for automatic ACP task tracking.
+ * spawn-interceptor v2.3 — OpenClaw plugin for automatic ACP task tracking.
  *
- * Hooks:
- *   before_tool_call: intercepts sessions_spawn to log and inject completion relay
- *   subagent_ended: updates task status when sub-agents finish (primary completion detection)
+ * Completion detection (layered, in priority order):
+ *   1. subagent_ended hook — works for runtime=subagent only
+ *   2. ACP session poller — reads ~/.acpx/sessions/index.json for closed sessions
+ *   3. Stale reaper — marks tasks stuck > 30min as timeout (final safety net)
  *
- * Defense mechanisms:
- *   - Persistent pending state survives Gateway restarts
- *   - Stale task reaper runs on startup and periodically, marking stuck tasks as timed out
- *   - OPTIONAL prompt relay as enhancement (not relied upon)
- *
- * Install: openclaw plugins install --link ~/.openclaw/plugins/spawn-interceptor
+ * Key insight: OpenClaw's subagent_ended hook does NOT fire for ACP runtime sessions.
+ * ACP sessions are managed by acpx, and their lifecycle is recorded in ~/.acpx/sessions/.
+ * The poller reads the index.json to find closed sessions, then matches them to pending
+ * tasks by creation time proximity.
  */
 
 import fs from 'fs';
@@ -20,13 +19,18 @@ import os from 'os';
 const SHARED_CTX = path.join(os.homedir(), '.openclaw', 'shared-context');
 const TASK_LOG = path.join(SHARED_CTX, 'monitor-tasks', 'task-log.jsonl');
 const PENDING_FILE = path.join(SHARED_CTX, 'monitor-tasks', '.pending-tasks.json');
+const ACPX_SESSIONS_DIR = path.join(os.homedir(), '.acpx', 'sessions');
+const ACPX_INDEX = path.join(ACPX_SESSIONS_DIR, 'index.json');
 const COMPLETION_SESSION = 'agent:main:completion-relay';
 
-const STALE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-const REAPER_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
+const STALE_TIMEOUT_MS = 30 * 60 * 1000;
+const REAPER_INTERVAL_MS = 5 * 60 * 1000;
+const ACP_POLL_INTERVAL_MS = 15 * 1000; // 15 seconds for faster detection
 
 let pendingTasks = new Map();
 let reaperTimer = null;
+let acpPollerTimer = null;
+let pluginLogger = null;
 
 function loadPending() {
   try {
@@ -58,10 +62,10 @@ function appendLog(entry) {
 }
 
 function relay(taskId) {
-  return `\n\n---\n[COMPLETION RELAY — OPTIONAL]\nIf possible, after completing all work, call sessions_send with:\n  sessionKey: "${COMPLETION_SESSION}"\n  message: {"type":"acp_completion","taskId":"${taskId}","status":"completed or failed","summary":"one-sentence result"}\nThis is optional — completion is also tracked automatically.\n---`;
+  return `\n\n---\n[COMPLETION RELAY — OPTIONAL]\nWhen done, call sessions_send with:\n  sessionKey: "${COMPLETION_SESSION}"\n  message: {"type":"acp_completion","taskId":"${taskId}","status":"completed or failed","summary":"one-sentence result"}\nThis is optional — completion is tracked automatically.\n---`;
 }
 
-function reapStaleTasks(logger) {
+function reapStaleTasks() {
   const now = Date.now();
   let reaped = 0;
 
@@ -69,7 +73,6 @@ function reapStaleTasks(logger) {
     const spawnedAt = new Date(task.spawnedAt).getTime();
     if (now - spawnedAt > STALE_TIMEOUT_MS) {
       pendingTasks.delete(taskId);
-
       appendLog({
         taskId,
         agentId: task.agentId,
@@ -80,35 +83,162 @@ function reapStaleTasks(logger) {
         status: 'timeout',
         completedAt: new Date().toISOString(),
         completionSource: 'stale_reaper',
-        reason: `no subagent_ended received within ${STALE_TIMEOUT_MS / 60000}min`,
+        reason: `no completion detected within ${STALE_TIMEOUT_MS / 60000}min`,
       });
-
       reaped++;
     }
   }
 
   if (reaped > 0) {
     savePending();
-    logger.info(`spawn-interceptor: reaped ${reaped} stale task(s), ${pendingTasks.size} still pending`);
+    if (pluginLogger) pluginLogger.info(`spawn-interceptor: reaped ${reaped} stale task(s), ${pendingTasks.size} still pending`);
+  }
+}
+
+/**
+ * Poll ~/.acpx/sessions/index.json for closed ACP sessions.
+ * Match closed sessions to pending ACP tasks by time proximity.
+ *
+ * Strategy: For each pending ACP task, find an acpx session whose created_at
+ * is within a 60-second window of the task's spawnedAt. If that session is
+ * closed, mark the task as completed.
+ *
+ * If no matching session found but task is older than 2 minutes and NO open
+ * ACP sessions exist, also mark as completed (batch cleanup).
+ */
+function pollAcpSessions() {
+  const acpPending = [...pendingTasks.entries()].filter(([, t]) => t.runtime === 'acp');
+  if (acpPending.length === 0) return;
+
+  let index;
+  try {
+    if (!fs.existsSync(ACPX_INDEX)) return;
+    index = JSON.parse(fs.readFileSync(ACPX_INDEX, 'utf-8'));
+  } catch { return; }
+
+  const entries = index.entries || [];
+  if (entries.length === 0) return;
+
+  const TIME_MATCH_WINDOW_MS = 60 * 1000;
+  const BATCH_CLEANUP_AGE_MS = 2 * 60 * 1000;
+  let completed = 0;
+
+  const closedSessions = [];
+  const openSessions = [];
+
+  for (const entry of entries) {
+    if (entry.closed) {
+      closedSessions.push(entry);
+    } else {
+      openSessions.push(entry);
+    }
+  }
+
+  for (const [taskId, task] of acpPending) {
+    const spawnTs = new Date(task.spawnedAt).getTime();
+
+    // Try to find a matching closed session by time proximity
+    let matched = false;
+    for (const session of closedSessions) {
+      // Read session file for detailed timing if needed
+      let sessionDetail = null;
+      try {
+        const fp = path.join(ACPX_SESSIONS_DIR, session.file);
+        if (fs.existsSync(fp)) {
+          sessionDetail = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+        }
+      } catch { /* skip */ }
+
+      const sessionCreatedAt = sessionDetail
+        ? new Date(sessionDetail.created_at).getTime()
+        : new Date(session.lastUsedAt).getTime();
+
+      const timeDiff = Math.abs(sessionCreatedAt - spawnTs);
+
+      if (timeDiff < TIME_MATCH_WINDOW_MS) {
+        const closedAt = sessionDetail?.closed_at || session.lastUsedAt || new Date().toISOString();
+        const sessionName = sessionDetail?.name || session.name || '?';
+
+        pendingTasks.delete(taskId);
+        appendLog({
+          taskId,
+          agentId: task.agentId,
+          sessionKey: task.sessionKey,
+          runtime: task.runtime,
+          task: task.task,
+          spawnedAt: task.spawnedAt,
+          status: 'completed',
+          completedAt: closedAt,
+          completionSource: 'acp_session_poller',
+          acpxSession: session.acpxRecordId,
+          acpxSessionName: sessionName,
+          reason: `acpx session closed (time match: ${Math.round(timeDiff / 1000)}s)`,
+        });
+
+        matched = true;
+        completed++;
+
+        if (pluginLogger) {
+          pluginLogger.info(`spawn-interceptor: ACP task ${taskId} → completed (acpx session ${session.acpxRecordId} closed, match=${Math.round(timeDiff / 1000)}s)`);
+        }
+        break;
+      }
+    }
+
+    // Batch cleanup: if task is old and no open ACP sessions exist
+    if (!matched) {
+      const age = Date.now() - spawnTs;
+      if (age > BATCH_CLEANUP_AGE_MS && openSessions.length === 0) {
+        pendingTasks.delete(taskId);
+        appendLog({
+          taskId,
+          agentId: task.agentId,
+          sessionKey: task.sessionKey,
+          runtime: task.runtime,
+          task: task.task,
+          spawnedAt: task.spawnedAt,
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          completionSource: 'acp_session_poller',
+          reason: `no open ACP sessions remain (task age: ${Math.round(age / 1000)}s)`,
+        });
+
+        completed++;
+
+        if (pluginLogger) {
+          pluginLogger.info(`spawn-interceptor: ACP task ${taskId} → completed (no open ACP sessions, age=${Math.round(age / 1000)}s)`);
+        }
+      }
+    }
+  }
+
+  if (completed > 0) {
+    savePending();
+    if (pluginLogger) {
+      pluginLogger.info(`spawn-interceptor: ACP poller completed ${completed} task(s), ${pendingTasks.size} still pending`);
+    }
   }
 }
 
 const spawnInterceptorPlugin = {
   id: 'spawn-interceptor',
   name: 'Spawn Interceptor',
-  description: 'Auto-tracks sessions_spawn and injects ACP completion relay',
-  version: '2.2.0',
+  description: 'Auto-tracks sessions_spawn and detects ACP completion via session polling',
+  version: '2.3.0',
 
   register(api) {
-    api.logger.info('spawn-interceptor v2.2: registering hooks (subagent_ended primary + stale reaper)');
+    pluginLogger = api.logger;
+    api.logger.info('spawn-interceptor v2.3: registering (subagent_ended + ACP session poller + stale reaper)');
 
     loadPending();
     if (pendingTasks.size > 0) {
       api.logger.info(`spawn-interceptor: restored ${pendingTasks.size} pending task(s) from disk`);
-      reapStaleTasks(api.logger);
+      reapStaleTasks();
+      pollAcpSessions(); // Immediate check on startup
     }
 
-    reaperTimer = setInterval(() => reapStaleTasks(api.logger), REAPER_INTERVAL_MS);
+    reaperTimer = setInterval(reapStaleTasks, REAPER_INTERVAL_MS);
+    acpPollerTimer = setInterval(pollAcpSessions, ACP_POLL_INTERVAL_MS);
 
     api.on('before_tool_call', (event, ctx) => {
       if (event.toolName !== 'sessions_spawn') return;
@@ -128,11 +258,10 @@ const spawnInterceptorPlugin = {
       };
 
       appendLog(taskEntry);
-
       pendingTasks.set(id, taskEntry);
       savePending();
 
-      api.logger.info(`spawn-interceptor: tracked task ${id} (runtime=${rt}, pending=${pendingTasks.size})`);
+      api.logger.info(`spawn-interceptor: tracked ${id} (runtime=${rt}, pending=${pendingTasks.size})`);
 
       if (rt === 'acp' && p.task) {
         return { params: { ...p, task: p.task + relay(id) } };
@@ -149,12 +278,7 @@ const spawnInterceptorPlugin = {
       let matchedTask = null;
 
       for (const [taskId, task] of pendingTasks.entries()) {
-        if (targetKey.includes(':acp:') && task.runtime === 'acp') {
-          matchedTaskId = taskId;
-          matchedTask = task;
-          break;
-        }
-        if (targetKey.includes(':subagent:') && task.runtime === 'subagent') {
+        if (task.runtime === 'subagent') {
           matchedTaskId = taskId;
           matchedTask = task;
           break;
@@ -169,7 +293,7 @@ const spawnInterceptorPlugin = {
         pendingTasks.delete(matchedTaskId);
         savePending();
 
-        const completionEntry = {
+        appendLog({
           taskId: matchedTaskId,
           agentId: matchedTask.agentId,
           sessionKey: matchedTask.sessionKey,
@@ -182,10 +306,9 @@ const spawnInterceptorPlugin = {
           reason,
           outcome,
           targetSessionKey: targetKey,
-        };
+        });
 
-        appendLog(completionEntry);
-        api.logger.info(`spawn-interceptor: task ${matchedTaskId} → ${completionStatus} (via subagent_ended, pending=${pendingTasks.size})`);
+        api.logger.info(`spawn-interceptor: ${matchedTaskId} → ${completionStatus} (subagent_ended, pending=${pendingTasks.size})`);
       } else {
         appendLog({
           event: 'subagent_ended',
@@ -197,11 +320,11 @@ const spawnInterceptorPlugin = {
           endedAt,
           matchedTask: false,
         });
-        api.logger.info(`spawn-interceptor: subagent ended (${targetKey}, ${reason}) — no matching pending task`);
+        api.logger.info(`spawn-interceptor: subagent ended (${targetKey}, ${reason}) — no pending match`);
       }
     });
 
-    api.logger.info('spawn-interceptor v2.2: hooks registered');
+    api.logger.info('spawn-interceptor v2.3: all hooks registered, ACP poller interval=15s');
   },
 };
 

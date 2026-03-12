@@ -1,13 +1,15 @@
 {
   "name": "spawn-interceptor",
-  "version": "2.2.0",
-  "description": "Auto-tracks sessions_spawn calls and injects ACP completion relay",
+  "version": "2.3.0",
+  "type": "module",
+  "description": "Auto-tracks sessions_spawn and detects ACP completion via session polling",
   "main": "index.js",
   "keywords": [
     "openclaw",
     "plugin",
     "multi-agent",
-    "task-tracking"
+    "task-tracking",
+    "acp-completion"
   ],
   "license": "MIT",
   "openclaw": {

@@ -6,7 +6,7 @@
 >
 > 统一、高效、可追溯的多 Agent 团队协作协议与架构模式，解决 ACP 异步通信不可靠、Agent 遗忘任务注册、timeout 语义模糊三大痛点。
 
-**Version**: 2026-03-13-v4
+**Version**: 2026-03-13-v5
 **License**: MIT
 **Status**: Production Ready (internally validated) / OSS Ready
 **Author**: lanyasheng (OpenClaw Community)
@@ -42,22 +42,26 @@ See [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) for the full problem anal
 ```
 Agent -> sessions_spawn(acp)
     | (before_tool_call hook auto-intercepts)
-spawn-interceptor plugin:
-    1. Log to task-log.jsonl
-    2. Inject completion callback instruction into ACP prompt
+spawn-interceptor plugin v2.3:
+    1. Log to task-log.jsonl (status: spawning)
+    2. Inject completion callback into ACP prompt (best-effort)
     |
-ACP Sub-Agent executes task
-    | (on completion — system event, not agent action)
-Gateway fires subagent_ended hook
+ACP Sub-Agent executes task -> acpx session file closes
     |
-spawn-interceptor -> Update task-log (completed/failed) -> Notify
+Completion detection (layered):
+    L1: subagent_ended hook     -> works for runtime=subagent
+    L2: ACP session poller      -> polls ~/.acpx/sessions/ every 15s (runtime=acp)
+    L3: Stale reaper            -> marks stuck tasks as timeout after 30min
     |
-    + Stale reaper: marks tasks as timeout if no event within 30min
+spawn-interceptor -> Update task-log (completed/failed/timeout) -> Notify
 ```
+
+**Key insight / 关键发现**: OpenClaw's `subagent_ended` hook does **NOT** fire for `acp` runtime sessions. ACP sessions are managed by `acpx`, and their lifecycle is tracked in `~/.acpx/sessions/`. The v2.3 ACP session poller reads these files to detect completion.
 
 **Zero cognitive load**: Agents don't need to remember any extra steps — the system handles everything automatically.
 
 **零认知负担**: Agent 不需要记住额外步骤，系统自动处理。
+**三层防御**: subagent_ended + ACP session 轮询 + 过期任务收割。
 
 ---
 
@@ -73,6 +77,7 @@ This framework exists partly because of unresolved bugs in OpenClaw's ACP subsys
 | [#35886](https://github.com/openclaw/openclaw/issues/35886) | ACP child processes not cleaned after TTL | Zombie process accumulation | Guardian health-check auto-restart |
 | [#40243](https://github.com/openclaw/openclaw/issues/40243) | Persistent session agent dies silently | Messages silently dropped | Prefer oneshot over persistent |
 | [#40272](https://github.com/openclaw/openclaw/issues/40272) | `notifyChannel` doesn't work in ACP | No native completion notification | `spawn-interceptor` + `completion-listener` |
+| (undocumented) | `subagent_ended` hook doesn't fire for `acp` runtime | ACP task status stuck at `spawning` | v2.3 ACP session poller (polls `~/.acpx/sessions/`) |
 
 For the **#34054 workaround** (zombie session cleanup), see [our detailed comment on GitHub](https://github.com/openclaw/openclaw/issues/34054#issuecomment-4048248380).
 
@@ -153,7 +158,7 @@ See [QUICKSTART.md](QUICKSTART.md) and [GETTING_STARTED.md](GETTING_STARTED.md) 
 ├── ANTIPATTERNS.md            # Pitfalls & lessons learned
 ├── plugins/
 │   └── spawn-interceptor/     # OpenClaw plugin — auto task tracking
-│       ├── index.js           # Plugin (before_tool_call + subagent_ended hooks)
+│       ├── index.js           # Plugin v2.3 (hooks + ACP session poller)
 │       ├── package.json
 │       ├── openclaw.plugin.json
 │       └── README.md
