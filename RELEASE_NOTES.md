@@ -1,6 +1,44 @@
 # Release Notes
 
 ---
+## v2.4.0 — 通信护栏 + 死信队列 + 任务链自动化 (2026-03-13)
+
+### 新增: Dead Letter Queue (DLQ)
+
+- 当任务通知投递失败超过 3 次，自动移入死信队列 `dlq.jsonl`
+- JSONL 持久化，支持回查和重试
+- `WatcherBus.stats` 新增 `tasks_dlq` 指标
+
+### 新增: Terminal Bridge（任务分发自动化）
+
+- 任务到达终态（completed/failed/timeout）时自动匹配 follow-up 规则
+- 规则引擎支持按 `trigger_state` + `trigger_task_type` 匹配
+- 分发记录持久化到 `dispatch-log.jsonl`
+- 支持自定义 `on_dispatch` 回调
+
+### 新增: Agent Communication Guardrail
+
+- **请求去重**: 同一 task_id + agent_id + content 在 TTL(300s) 内自动去重
+- **身份检查**: 禁止冒充 `system/gateway/admin/root` 等保留身份
+- **Channel 保护**: `completion-relay` 和 `system` channel 仅允许 `main` agent 写入
+- `WatcherBus.stats` 新增 `guardrail_blocked` 指标
+
+### 架构影响
+
+```
+task-callback-bus v1.1.0 (2,543 行, +247 行)
+├── bus.py              — 主编排器 (+30 行集成逻辑)
+├── dead_letter_queue.py — DLQ (60 行, 新)
+├── terminal_bridge.py   — 任务链自动化 (98 行, 新)
+├── guardrail.py         — 通信护栏 (89 行, 新)
+└── __init__.py          — 导出更新 (+20 行)
+```
+
+### 验证
+
+- `watcher.py --once` 运行正常，3 个活跃任务正常检查
+- DLQ/Terminal Bridge/Guardrail 在条件触发时自动生效
+
 
 ## v2.3.0 — ACP Session Poller: 真正的完成检测闭环 (2026-03-13)
 
