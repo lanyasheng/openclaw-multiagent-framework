@@ -1,12 +1,11 @@
 /**
  * spawn-interceptor — OpenClaw plugin for automatic ACP task tracking.
  *
- * Uses two hooks:
- *   1. before_tool_call: intercepts sessions_spawn to inject completion relay
- *   2. subagent_ended: logs completion when sub-agents finish
+ * Hooks:
+ *   before_tool_call: intercepts sessions_spawn to inject completion relay
+ *   subagent_ended: logs when sub-agents finish
  *
- * Install: copy to ~/.openclaw/plugins/spawn-interceptor/
- * Config:  add "spawn-interceptor" to plugins.allow in openclaw.json
+ * Install: openclaw plugins install --link ~/.openclaw/plugins/spawn-interceptor
  */
 
 const fs = require('fs');
@@ -30,23 +29,19 @@ function log(entry) {
 }
 
 function relay(taskId) {
-  return `
-
----
-[COMPLETION RELAY]
-When ALL work is done, execute sessions_send with:
-  sessionKey: "${COMPLETION_SESSION}"
-  message: JSON with fields:
-    type: "acp_completion"
-    taskId: "${taskId}"
-    status: "completed" or "failed"
-    summary: one-sentence result
----`;
+  return `\n\n---\n[COMPLETION RELAY]\nWhen ALL work is done, execute sessions_send with:\n  sessionKey: "${COMPLETION_SESSION}"\n  message: JSON with fields:\n    type: "acp_completion"\n    taskId: "${taskId}"\n    status: "completed" or "failed"\n    summary: one-sentence result\n---`;
 }
 
 module.exports = {
-  hooks: {
-    before_tool_call(event, ctx) {
+  id: 'spawn-interceptor',
+  name: 'Spawn Interceptor',
+  description: 'Auto-tracks sessions_spawn and injects ACP completion relay',
+  version: '1.0.0',
+
+  register(api) {
+    api.logger.info('spawn-interceptor: registering hooks');
+
+    api.on('before_tool_call', (event, ctx) => {
       if (event.toolName !== 'sessions_spawn') return;
 
       const p = event.params || {};
@@ -64,17 +59,24 @@ module.exports = {
       });
 
       if (rt === 'acp' && p.task) {
+        api.logger.info(`spawn-interceptor: injecting relay for task ${id} (acp)`);
         return { params: { ...p, task: p.task + relay(id) } };
       }
-    },
+    });
 
-    subagent_ended(event, ctx) {
+    api.on('subagent_ended', (event, ctx) => {
       log({
         event: 'subagent_ended',
-        childSessionKey: event.childSessionKey || '?',
-        agentId: ctx.agentId || '?',
+        targetSessionKey: event.targetSessionKey || '?',
+        targetKind: event.targetKind || 'unknown',
+        reason: event.reason || '',
+        outcome: event.outcome || '',
+        agentId: ctx.runId || '?',
         endedAt: new Date().toISOString()
       });
-    }
+      api.logger.info(`spawn-interceptor: subagent ended (${event.targetSessionKey}, ${event.reason})`);
+    });
+
+    api.logger.info('spawn-interceptor: hooks registered');
   }
 };

@@ -3,6 +3,16 @@
   "version": "1.0.0",
   "description": "Auto-tracks sessions_spawn calls and injects ACP completion relay",
   "main": "index.js",
-  "keywords": ["openclaw", "plugin", "multi-agent", "task-tracking"],
-  "license": "MIT"
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "multi-agent",
+    "task-tracking"
+  ],
+  "license": "MIT",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
 }
