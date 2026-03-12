@@ -359,4 +359,4 @@ def check_completion_relay():
 
 ---
 
-*设计者: NanoCompose 工作区 | 2026-03-12*
+*设计者: openclaw-multiagent-framework | 2026-03-12**

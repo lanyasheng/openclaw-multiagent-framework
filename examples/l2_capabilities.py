@@ -455,7 +455,7 @@ def demo_deliverable():
         evidence=[
             "HumanEval benchmark: GPT-4o 92.1% vs Claude 3.5 80.3%",
             "MBPP benchmark: GPT-4o 86.4% vs Claude 3.5 83.7%",
-            "Internal eval on 50 NanoCompose tasks: GPT-4o 78% vs Claude 3.5 71%",
+            "Internal eval on 50 benchmark tasks: GPT-4o 78% vs Claude 3.5 71%",
         ],
         actions=[
             "Update default model config to prefer GPT-4o for code tasks",
