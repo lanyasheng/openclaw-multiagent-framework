@@ -42,13 +42,16 @@
 git clone https://github.com/lanyasheng/openclaw-multiagent-framework.git
 cd openclaw-multiagent-framework
 
-# 2. 复制到你的 shared-context 目录
-cp -r * ~/.openclaw/shared-context/
+# 2. 设置框架根目录（根据你的部署调整）
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
 
-# 3. 创建必要目录
-mkdir -p ~/.openclaw/shared-context/{job-status,monitor-tasks,dispatches,intel,followups}
+# 3. 复制到你的 shared-context 目录
+cp -r * $FRAMEWORK_HOME/shared-context/
 
-# 4. 阅读接入指引，了解 MVP 与进阶能力
+# 4. 创建必要目录
+mkdir -p $FRAMEWORK_HOME/shared-context/{job-status,monitor-tasks,dispatches,intel,followups}
+
+# 5. 阅读接入指引，了解 MVP 与进阶能力
 open GETTING_STARTED.md
 ```
 

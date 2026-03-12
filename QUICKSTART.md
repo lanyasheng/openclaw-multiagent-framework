@@ -15,7 +15,7 @@
 |------|------|----------|
 | Python | 3.10+ | `python3 --version` |
 | OpenClaw Gateway | 运行中 | `launchctl list | grep openclaw` |
-| 目录权限 | 可写 | `touch ~/.openclaw/shared-context/.test` |
+| 目录权限 | 可写 | `mkdir -p ./shared-context && touch ./shared-context/.test` |
 
 **所需 Python 包**（框架本身不依赖，但示例脚本可能需要）：
 ```bash
@@ -29,19 +29,25 @@ pip3 install pydantic  # 如果需要运行验证脚本
 ### 步骤 1：创建必要目录（1 分钟）
 
 ```bash
-mkdir -p ~/.openclaw/shared-context/{job-status,monitor-tasks,dispatches,intel,followups,archive/protocol-history}
+# 设置框架根目录（根据你的部署调整）
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
+mkdir -p $FRAMEWORK_HOME/shared-context/{job-status,monitor-tasks,dispatches,intel,followups,archive/protocol-history}
 ```
 
 ### 步骤 2：复制框架文档（1 分钟）
 
 ```bash
-cp -r ~/.openclaw/repos/openclaw-multiagent-framework/* \
-      ~/.openclaw/shared-context/
+# 假设你已克隆本仓库到 openclaw-multiagent-framework/
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
+cp -r openclaw-multiagent-framework/* \
+      $FRAMEWORK_HOME/shared-context/
 ```
 
 ### 步骤 3：配置你的 Agent 团队（3 分钟）
 
-编辑 `~/.openclaw/shared-context/AGENT_PROTOCOL.md`，替换为你的团队配置：
+编辑 `$FRAMEWORK_HOME/shared-context/AGENT_PROTOCOL.md`，替换为你的团队配置：
 
 ```markdown
 ## 你的 Agent 团队示例
@@ -60,6 +66,8 @@ cp -r ~/.openclaw/repos/openclaw-multiagent-framework/* \
 
 ### 示例：注册并监控一个后台任务
 
+> **注意**：以下示例展示框架概念。开源用户需自行实现 `register_generic_task.py` 或参考 `examples/task_state_machine.py`。
+
 ```bash
 #!/bin/bash
 # save as: test-framework.sh
@@ -67,9 +75,13 @@ cp -r ~/.openclaw/repos/openclaw-multiagent-framework/* \
 set -e
 
 # ========== 配置 ==========
+# 设置框架根目录（根据你的部署调整）
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
 TASK_ID="test_task_$(date +%s)"
-STATUS_FILE="$HOME/.openclaw/shared-context/job-status/${TASK_ID}.json"
-OUTPUT_FILE="$HOME/.openclaw/shared-context/job-status/${TASK_ID}-report.md"
+STATUS_FILE="$FRAMEWORK_HOME/shared-context/job-status/${TASK_ID}.json"
+OUTPUT_FILE="$FRAMEWORK_HOME/shared-context/job-status/${TASK_ID}-report.md"
+TASKS_FILE="$FRAMEWORK_HOME/shared-context/monitor-tasks/tasks.jsonl"
 
 echo "📝 Task ID: $TASK_ID"
 echo "📝 Status File: $STATUS_FILE"
@@ -79,21 +91,25 @@ echo "📝 Output File: $OUTPUT_FILE"
 echo ""
 echo "🔧 Step 1: Registering task..."
 
-python3 ~/.openclaw/workspace/skills/task_callback_bus/scripts/register_generic_task.py \
-  --task-id "$TASK_ID" \
-  --task-type sessions_spawn \
-  --status-file "$STATUS_FILE" \
-  --output-file "$OUTPUT_FILE" \
-  --reply-to "user:main" \
-  --owner main \
-  --task-subject "框架测试任务" \
-  --silent-until-terminal
+# 注：以下命令为内部实现示例，开源用户需自行开发
+# python3 $FRAMEWORK_HOME/skills/task_callback_bus/scripts/register_generic_task.py \
+#   --task-id "$TASK_ID" \
+#   --task-type sessions_spawn \
+#   --status-file "$STATUS_FILE" \
+#   --output-file "$OUTPUT_FILE" \
+#   --reply-to "user:main" \
+#   --owner main \
+#   --task-subject "框架测试任务" \
+#   --silent-until-terminal
+
+# 模拟任务注册（实际使用时替换为真实的任务注册逻辑）
+echo "{\"task_id\": \"$TASK_ID\", \"state\": \"registered\"}" >> "$TASKS_FILE"
 
 # ========== 2. 验证注册成功 ==========
 echo ""
 echo "🔍 Step 2: Verifying registration..."
 
-if grep -q "\"task_id\": \"$TASK_ID\"" ~/.openclaw/shared-context/monitor-tasks/tasks.jsonl; then
+if grep -q "\"task_id\": \"$TASK_ID\"" "$TASKS_FILE"; then
     echo "✅ Task registered successfully"
 else
     echo "❌ Task registration failed"
@@ -183,9 +199,9 @@ echo "   Status File: $STATUS_FILE"
 echo "   Report File: $OUTPUT_FILE"
 echo ""
 echo "📋 故障排查时查看:"
-echo "   - 任务注册: ~/.openclaw/shared-context/monitor-tasks/tasks.jsonl"
-echo "   - Watcher 日志: ~/.openclaw/shared-context/monitor-tasks/watcher.log"
-echo "   - 通知记录: ~/.openclaw/shared-context/monitor-tasks/notifications/"
+echo "   - 任务注册: $FRAMEWORK_HOME/shared-context/monitor-tasks/tasks.jsonl"
+echo "   - Watcher 日志: $FRAMEWORK_HOME/shared-context/monitor-tasks/watcher.log"
+echo "   - 通知记录: $FRAMEWORK_HOME/shared-context/monitor-tasks/notifications/"
 ```
 
 **运行方法：**
@@ -194,7 +210,7 @@ chmod +x test-framework.sh
 ./test-framework.sh
 ```
 
-> **注意**：此脚本引用内部实现路径（`~/.openclaw/workspace/skills/task_callback_bus/`）。开源用户需自行实现 `register_generic_task.py` 或参考 [INTERNAL_VS_OSS.md](INTERNAL_VS_OSS.md) 了解差异。
+> **重要提示**：此示例脚本展示框架概念，不依赖内部实现。开源用户需自行开发 `register_generic_task.py` 或参考 `examples/task_state_machine.py` 中的状态管理示例。详见 [INTERNAL_VS_OSS.md](INTERNAL_VS_OSS.md)。
 
 ---
 
@@ -246,9 +262,12 @@ chmod +x test-framework.sh
 #### 排查步骤 1：检查任务是否注册成功
 
 ```bash
+# 设置框架根目录（根据你的部署调整）
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
 # 在 tasks.jsonl 中查找任务
 TASK_ID="your_task_id"
-grep "\"task_id\": \"$TASK_ID\"" ~/.openclaw/shared-context/monitor-tasks/tasks.jsonl
+grep "\"task_id\": \"$TASK_ID\"" $FRAMEWORK_HOME/shared-context/monitor-tasks/tasks.jsonl
 
 # 应该看到包含 task_id 的 JSON 行
 # 如果没有输出，说明注册失败
@@ -257,8 +276,10 @@ grep "\"task_id\": \"$TASK_ID\"" ~/.openclaw/shared-context/monitor-tasks/tasks.
 #### 排查步骤 2：检查 status_file 是否存在且格式正确
 
 ```bash
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
 TASK_ID="your_task_id"
-cat ~/.openclaw/shared-context/job-status/${TASK_ID}.json
+cat $FRAMEWORK_HOME/shared-context/job-status/${TASK_ID}.json
 
 # 应该包含 {"state": "completed"} 或 {"state": "failed"}
 # 如果文件不存在或格式错误，watcher 无法检测到终态
@@ -267,8 +288,10 @@ cat ~/.openclaw/shared-context/job-status/${TASK_ID}.json
 #### 排查步骤 3：检查 watcher 日志
 
 ```bash
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
 # 查看 watcher 运行日志
-tail -50 ~/.openclaw/shared-context/monitor-tasks/watcher.log
+tail -50 $FRAMEWORK_HOME/shared-context/monitor-tasks/watcher.log
 
 # 查找与你的 task_id 相关的日志
 ```
@@ -276,20 +299,22 @@ tail -50 ~/.openclaw/shared-context/monitor-tasks/watcher.log
 #### 排查步骤 4：检查通知是否已生成
 
 ```bash
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
 # 查看通知目录
-ls -la ~/.openclaw/shared-context/monitor-tasks/notifications/ | grep "$TASK_ID"
+ls -la $FRAMEWORK_HOME/shared-context/monitor-tasks/notifications/ | grep "$TASK_ID"
 
 # 如果存在对应的通知文件，说明 watcher 已工作，问题可能在推送环节
 ```
 
-#### 排查步骤 5：验证文件路径
+#### 排查步骤 5：验证任务注册脚本
 
 ```bash
-# 确认 register_generic_task.py 路径正确
-ls -la ~/.openclaw/workspace/skills/task_callback_bus/scripts/register_generic_task.py
+# 确认 register_generic_task.py 存在（需自行实现）
+# 示例路径（根据你的部署调整）：
+ls -la $FRAMEWORK_HOME/skills/task_callback_bus/scripts/register_generic_task.py
 
-# 如果不存在，检查实际路径
-find ~/.openclaw/workspace/skills -name "register_generic_task.py" 2>/dev/null
+# 如果不存在，需自行开发或参考 examples/task_state_machine.py
 ```
 
 ### 常见错误及修复
@@ -306,7 +331,9 @@ find ~/.openclaw/workspace/skills -name "register_generic_task.py" 2>/dev/null
 
 ```bash
 # 如果怀疑 watcher 有问题，可以手动模拟通知
-cat > ~/.openclaw/shared-context/monitor-tasks/notifications/test_$(date +%s).json << EOF
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
+cat > $FRAMEWORK_HOME/shared-context/monitor-tasks/notifications/test_$(date +%s).json << EOF
 {
   "task_id": "test_manual",
   "state": "completed",

@@ -94,9 +94,9 @@ for t in task.record.history:
 Examples use these environment variables (with defaults):
 
 - `OPENCLAW_STATUS_DIR`: Status file location
-  - Default: `~/.openclaw/shared-context/job-status`
+  - Default: `./shared-context/job-status`
 - `OPENCLAW_NOTIFICATION_DIR`: Watcher notification directory
-  - Default: `~/.openclaw/shared-context/monitor-tasks/notifications`
+  - Default: `./shared-context/monitor-tasks/notifications`
 
 ## Notes
 

@@ -156,11 +156,11 @@ class TaskStateMachine:
         self.agent = agent
         self.status_dir = status_dir or Path(os.environ.get(
             "OPENCLAW_STATUS_DIR",
-            "~/.openclaw/shared-context/job-status"
+            "./shared-context/job-status"
         )).expanduser()
         self.notification_dir = notification_dir or Path(os.environ.get(
             "OPENCLAW_NOTIFICATION_DIR",
-            "~/.openclaw/shared-context/monitor-tasks/notifications"
+            "./shared-context/monitor-tasks/notifications"
         )).expanduser()
 
         # Ensure directories exist

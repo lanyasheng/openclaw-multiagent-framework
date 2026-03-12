@@ -80,9 +80,12 @@
 
 **核心动作**：
 ```bash
+# 设置框架根目录（根据你的部署调整）
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
 # 每天创建 follow-up 文件
-mkdir -p ~/.openclaw/shared-context/followups/
-cat > ~/.openclaw/shared-context/followups/$(date +%Y-%m-%d).md << 'EOF'
+mkdir -p $FRAMEWORK_HOME/shared-context/followups/
+cat > $FRAMEWORK_HOME/shared-context/followups/$(date +%Y-%m-%d).md << 'EOF'
 # Follow-ups for TODAY
 
 | 事项 | Priority | Owner | 状态 | 证据路径 |
@@ -107,7 +110,10 @@ EOF
 
 **最小目录**：
 ```bash
-mkdir -p ~/.openclaw/shared-context/{job-status,dispatches,intel,followups}
+# 设置框架根目录（根据你的部署调整）
+export FRAMEWORK_HOME=${FRAMEWORK_HOME:-~/.openclaw}
+
+mkdir -p $FRAMEWORK_HOME/shared-context/{job-status,dispatches,intel,followups}
 ```
 
 ---
@@ -281,7 +287,7 @@ MVP (第 1 周) → 习惯养成 (第 2-3 周) → 自动化 (第 4 周+)
 - [ ] OpenClaw 已安装并运行
 - [ ] 至少配置 1 个以上 Agent
 - [ ] Python 3.10+ 可用
-- [ ] `~/.openclaw/shared-context/` 目录可写
+- [ ] 框架目录（如 `shared-context/`）可写
 
 ### MVP 部署后
 

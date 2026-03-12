@@ -131,8 +131,11 @@ ACK 最小格式：
 
 #### 最小注册模板 (推荐 wrapper)
 
+> **注意**：以下脚本为内部实现示例。开源用户需自行实现任务注册逻辑，或参考 `examples/task_state_machine.py` 中的状态管理示例。
+
 ```bash
-python3 ~/.openclaw/workspace/skills/task_callback_bus/scripts/spawn_acp_with_watcher.py \
+# 内部实现示例（需自行开发）
+python3 <YOUR_FRAMEWORK_HOME>/skills/task_callback_bus/scripts/spawn_acp_with_watcher.py \
   --task-id <task_id> \
   --task-subject "<任务主题>" \
   --prompt-file <prompt_file> \
@@ -142,13 +145,14 @@ python3 ~/.openclaw/workspace/skills/task_callback_bus/scripts/spawn_acp_with_wa
 ```
 
 wrapper 自动生成:
-- `status_file`: `~/.openclaw/shared-context/job-status/<task_id>.json`
-- `report_file`: `~/.openclaw/shared-context/job-status/reports/<task_id>.md`
+- `status_file`: `<YOUR_FRAMEWORK_HOME>/shared-context/job-status/<task_id>.json`
+- `report_file`: `<YOUR_FRAMEWORK_HOME>/shared-context/job-status/reports/<task_id>.md`
 
 #### 最小注册模板 (手动注册 - 备选)
 
 ```bash
-python3 ~/.openclaw/workspace/skills/task_callback_bus/scripts/register_generic_task.py \
+# 内部实现示例（需自行开发）
+python3 <YOUR_FRAMEWORK_HOME>/skills/task_callback_bus/scripts/register_generic_task.py \
   --task-id <task_id> \
   --task-type sessions_spawn \
   --status-file <status_file> \
@@ -291,8 +295,8 @@ main 每天必须回答两个问题：
 
 ## 10. 现阶段唯一规范入口
 
-- 协议总入口：`~/.openclaw/shared-context/AGENT_PROTOCOL.md`
-- 历史设计/审计/实现文档：归档到 `~/.openclaw/shared-context/archive/protocol-history/`
+- 协议总入口：本仓库的 `AGENT_PROTOCOL.md`（当前阅读的文件）
+- 历史设计/审计/实现文档：建议归档到 `./docs/archive/protocol-history/`
 
 如果旧文档与本文件冲突，以本文件为准。
 
