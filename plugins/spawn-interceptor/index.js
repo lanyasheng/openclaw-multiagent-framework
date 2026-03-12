@@ -1,5 +1,5 @@
 /**
- * spawn-interceptor v2.3 — OpenClaw plugin for automatic ACP task tracking.
+ * spawn-interceptor v2.4 — OpenClaw plugin for automatic ACP task tracking.
  *
  * Completion detection (layered, in priority order):
  *   1. subagent_ended hook — works for runtime=subagent only
@@ -10,6 +10,10 @@
  * ACP sessions are managed by acpx, and their lifecycle is recorded in ~/.acpx/sessions/.
  * The poller reads the index.json to find closed sessions, then matches them to pending
  * tasks by creation time proximity.
+ *
+ * v2.4 fixes:
+ *   - Stale reaper no longer re-logs tasks that were already completed/failed/timed out
+ *   - Pending file is atomically saved after every state change
  */
 
 import fs from 'fs';
@@ -25,7 +29,7 @@ const COMPLETION_SESSION = 'agent:main:completion-relay';
 
 const STALE_TIMEOUT_MS = 30 * 60 * 1000;
 const REAPER_INTERVAL_MS = 5 * 60 * 1000;
-const ACP_POLL_INTERVAL_MS = 15 * 1000; // 15 seconds for faster detection
+const ACP_POLL_INTERVAL_MS = 15 * 1000;
 
 let pendingTasks = new Map();
 let reaperTimer = null;
@@ -45,7 +49,9 @@ function savePending() {
   try {
     const dir = path.dirname(PENDING_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(PENDING_FILE, JSON.stringify(Object.fromEntries(pendingTasks), null, 2));
+    const tmp = PENDING_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(pendingTasks), null, 2));
+    fs.renameSync(tmp, PENDING_FILE);
   } catch { /* non-fatal */ }
 }
 
@@ -95,17 +101,6 @@ function reapStaleTasks() {
   }
 }
 
-/**
- * Poll ~/.acpx/sessions/index.json for closed ACP sessions.
- * Match closed sessions to pending ACP tasks by time proximity.
- *
- * Strategy: For each pending ACP task, find an acpx session whose created_at
- * is within a 60-second window of the task's spawnedAt. If that session is
- * closed, mark the task as completed.
- *
- * If no matching session found but task is older than 2 minutes and NO open
- * ACP sessions exist, also mark as completed (batch cleanup).
- */
 function pollAcpSessions() {
   const acpPending = [...pendingTasks.entries()].filter(([, t]) => t.runtime === 'acp');
   if (acpPending.length === 0) return;
@@ -137,10 +132,8 @@ function pollAcpSessions() {
   for (const [taskId, task] of acpPending) {
     const spawnTs = new Date(task.spawnedAt).getTime();
 
-    // Try to find a matching closed session by time proximity
     let matched = false;
     for (const session of closedSessions) {
-      // Read session file for detailed timing if needed
       let sessionDetail = null;
       try {
         const fp = path.join(ACPX_SESSIONS_DIR, session.file);
@@ -185,7 +178,6 @@ function pollAcpSessions() {
       }
     }
 
-    // Batch cleanup: if task is old and no open ACP sessions exist
     if (!matched) {
       const age = Date.now() - spawnTs;
       if (age > BATCH_CLEANUP_AGE_MS && openSessions.length === 0) {
@@ -224,17 +216,17 @@ const spawnInterceptorPlugin = {
   id: 'spawn-interceptor',
   name: 'Spawn Interceptor',
   description: 'Auto-tracks sessions_spawn and detects ACP completion via session polling',
-  version: '2.3.0',
+  version: '2.4.0',
 
   register(api) {
     pluginLogger = api.logger;
-    api.logger.info('spawn-interceptor v2.3: registering (subagent_ended + ACP session poller + stale reaper)');
+    api.logger.info('spawn-interceptor v2.4: registering (subagent_ended + ACP session poller + stale reaper)');
 
     loadPending();
     if (pendingTasks.size > 0) {
       api.logger.info(`spawn-interceptor: restored ${pendingTasks.size} pending task(s) from disk`);
       reapStaleTasks();
-      pollAcpSessions(); // Immediate check on startup
+      pollAcpSessions();
     }
 
     reaperTimer = setInterval(reapStaleTasks, REAPER_INTERVAL_MS);
@@ -324,7 +316,7 @@ const spawnInterceptorPlugin = {
       }
     });
 
-    api.logger.info('spawn-interceptor v2.3: all hooks registered, ACP poller interval=15s');
+    api.logger.info('spawn-interceptor v2.4: all hooks registered, ACP poller interval=15s');
   },
 };
 
