@@ -50,7 +50,7 @@ After a day of multi-agent orchestration, you ask: "What tasks were spawned toda
 
 Instead of teaching agents to remember extra steps (which always fails), we intercept at the system level using OpenClaw's plugin hooks (which always works).
 
-### spawn-interceptor Plugin (v2.3)
+### spawn-interceptor Plugin (v2.4)
 
 A single OpenClaw plugin (~250 lines of JavaScript) that:
 
@@ -68,7 +68,7 @@ Agent calls sessions_spawn()
          │
          ▼
 ┌─────────────────────────────────────────────────┐
-│             spawn-interceptor v2.3              │
+│             spawn-interceptor v2.4              │
 │          (OpenClaw Plugin, ~250 lines)          │
 ├─────────────────────────────────────────────────┤
 │                                                 │
@@ -174,8 +174,7 @@ Our completion detection went through 3 iterations before landing on the current
 ### 1. Install the plugin
 
 ```bash
-cp -r plugins/spawn-interceptor ~/.openclaw/plugins/
-openclaw plugins install --link ~/.openclaw/plugins/spawn-interceptor
+cp -r plugins/spawn-interceptor ~/.openclaw/extensions/
 ```
 
 ### 2. Restart the Gateway

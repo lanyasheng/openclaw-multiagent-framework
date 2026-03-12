@@ -288,8 +288,8 @@ def check_completion_relay():
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| ACP Agent 不遵循 prompt 回调指令 | 部分任务无完成通知 | **已验证**: ACP 确实忽略回调。v2.3 改用 ACP session poller |
-| `subagent_ended` 不对 ACP runtime 触发 | ACP 任务永远卡在 spawning | **已验证并修复**: v2.3 ACP session poller 轮询 ~/.acpx/sessions/ |
+| ACP Agent 不遵循 prompt 回调指令 | 部分任务无完成通知 | **已验证**: ACP 确实忽略回调。v2.4 改用 ACP session poller |
+| `subagent_ended` 不对 ACP runtime 触发 | ACP 任务永远卡在 spawning | **已验证并修复**: v2.4 ACP session poller 轮询 ~/.acpx/sessions/ |
 | before_tool_call hook 尚未完全 wired (Issue #5943) | Plugin 不生效 | **已验证**: 当前版本 hook 正常工作 |
 | sessions_send 到 completion-relay 也 timeout | 通知丢失 | 不再依赖此路径，ACP session poller 为主 |
 | OpenClaw 升级导致 plugin API 变化 | Plugin 失效 | 锁定 API 版本，升级前测试 |
@@ -299,12 +299,12 @@ def check_completion_relay():
 如果 before_tool_call plugin 当前版本不可用，方案降级为：
 
 ```
-完整方案 (v2.3):  Plugin hook + ACP session poller + Stale reaper + Listener
+完整方案 (v2.4):  Plugin hook + ACP session poller + Stale reaper + Listener
 降级方案:          Plugin hook + Stale reaper (无 poller, 30min 超时收割)
 最小方案:          Prompt 注入 (ACP 可能忽略) + 人工检查
 ```
 
-**v2.3 验证结论**: Prompt 注入回调是不可靠的（ACP oneshot agent 完成主任务后直接退出），`subagent_ended` hook 不对 ACP 触发。真正可靠的检测方式是轮询 `~/.acpx/sessions/` 的 `closed` 字段。
+**v2.4 验证结论**: Prompt 注入回调是不可靠的（ACP oneshot agent 完成主任务后直接退出），`subagent_ended` hook 不对 ACP 触发。真正可靠的检测方式是轮询 `~/.acpx/sessions/` 的 `closed` 字段。
 
 ---
 

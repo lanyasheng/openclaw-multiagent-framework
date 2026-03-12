@@ -39,7 +39,7 @@
 
 **特点**：
 - 适用于 >10 秒的长任务
-- `spawn-interceptor` 自动拦截 `sessions_spawn` 并记录到 task-log（v2.3: 含 ACP session poller）
+- `spawn-interceptor` 自动拦截 `sessions_spawn` 并记录到 task-log（v2.4: 含 ACP session poller + 原子持久化）
 - ACP 任务自动注入完成回调，完成时通过 `sessions_send` 回推结果
 - `completion-listener` 处理通知并更新 task-log 状态
 
@@ -396,7 +396,7 @@ stateDiagram-v2
 
 ## 统一监控: task-log.jsonl
 
-v2.3 引入了统一的 `task-log.jsonl` 作为所有任务事件的单一事实源。
+v2.3+ 引入了统一的 `task-log.jsonl` 作为所有任务事件的单一事实源。
 
 ### 写入方
 
