@@ -349,7 +349,7 @@ T+终态: 发送 Final (仅一次)
 
 发送方收到 `timeout` 后:
 1. 查询状态文件 `shared-context/job-status/{ack_id}.json`
-2. 如果 state 是 `acknowledged/started/in_progress` → 等待 watcher
+2. 如果 state 是 `acknowledged/started/in_progress` → 等待 completion-listener 通知
 3. 如果 state 是 `completed` → 检查 report_file
 4. 如果无状态文件 → 可能投递失败，人工介入
 

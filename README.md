@@ -1,159 +1,192 @@
+# OpenClaw Multi-Agent Collaboration Framework
+
 # OpenClaw 多 Agent 协作框架
 
-> 统一、高效、可追溯的多 Agent 团队协作协议与架构模式
+> A battle-tested multi-agent collaboration protocol and architecture for OpenClaw, tackling unreliable ACP communication, agent task-registration amnesia, and ambiguous timeout semantics.
+>
+> 统一、高效、可追溯的多 Agent 团队协作协议与架构模式，解决 ACP 异步通信不可靠、Agent 遗忘任务注册、timeout 语义模糊三大痛点。
 
-**Version**: 2026-03-12-v2
+**Version**: 2026-03-13-v3
 **License**: MIT
-**Status**: Production Ready (内部验证) / OSS Ready
-**作者**: lanyasheng (OpenClaw 社区)
+**Status**: Production Ready (internally validated) / OSS Ready
+**Author**: lanyasheng (OpenClaw Community)
 
 ---
 
-## 一句话说明
+## What problem does this solve? / 解决什么问题
 
-这是一套**经过实战验证的 OpenClaw 多 Agent 协作框架**，解决 ACP 异步通信不可靠、Agent 遗忘任务注册、timeout 语义模糊三大痛点。
-
----
-
-## 解决什么问题
+| Problem | Root Cause | Our Solution |
+|---------|-----------|-------------|
+| ACP task completion has no notification | OpenClaw Bug [#40272](https://github.com/openclaw/openclaw/issues/40272) — `notifyChannel` not forwarded | `spawn-interceptor` plugin auto-injects completion callback |
+| Agent forgets to register monitoring | LLM muscle memory points to native tools | `before_tool_call` hook intercepts automatically |
+| Timeout gives no success/failure signal | `sessions_send` only returns ok/timeout | Deterministic tracking via `task-log.jsonl` |
+| Long-running task execution | Sync-wait or manual follow-up | Background execution + completion callback push |
+| Cross-agent collaboration | Free-form, hard to trace | Standard handoff template (request/ack/final) |
+| Source of truth management | Relies on chat history | State file + report file dual persistence |
 
 | 问题 | 根因 | 本框架方案 |
 |------|------|------------|
-| ACP 任务完成没通知 | OpenClaw Bug #40272 (notifyChannel 不转发) | spawn-interceptor plugin 自动注入完成回调 |
+| ACP 任务完成没通知 | OpenClaw Bug [#40272](https://github.com/openclaw/openclaw/issues/40272) (notifyChannel 不转发) | spawn-interceptor plugin 自动注入完成回调 |
 | Agent 忘记注册监控 | LLM 肌肉记忆指向原生工具 | before_tool_call hook 自动拦截 |
 | timeout 不知道成败 | sessions_send 只有 ok/timeout | task-log 确定性追踪 |
 | 长任务执行 | 同步等待 or 口头催办 | 后台执行 + 完成回调推送 |
 | 跨 Agent 协作 | 自由格式，难以追溯 | 标准 handoff 模板 (request/ack/final) |
 | 真值管理 | 依赖聊天历史 | 状态文件 + 报告文件双落盘 |
 
-详见 [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) — 完整的问题分析和设计方案。
+See [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) for the full problem analysis and design rationale.
 
 ---
 
-## 核心架构
+## Core Architecture / 核心架构
 
 ```
 Agent -> sessions_spawn(acp)
-    | (before_tool_call hook 自动拦截)
+    | (before_tool_call hook auto-intercepts)
 spawn-interceptor plugin:
-    1. 记录到 task-log.jsonl
-    2. 注入完成回调指令到 ACP prompt
+    1. Log to task-log.jsonl
+    2. Inject completion callback instruction into ACP prompt
     |
-ACP 子 Agent 执行任务
-    | (完成时)
+ACP Sub-Agent executes task
+    | (on completion)
 ACP -> sessions_send -> completion-relay session
     |
-completion-listener -> 更新 task-log -> 通知用户
+completion-listener -> Update task-log -> Notify user
 ```
+
+**Zero cognitive load**: Agents don't need to remember any extra steps — the system handles everything automatically.
 
 **零认知负担**: Agent 不需要记住额外步骤，系统自动处理。
 
 ---
 
-## 快速开始
+## Known OpenClaw Bugs & Workarounds / 已知 OpenClaw Bug 与临时方案
 
-### 前置条件
+This framework exists partly because of unresolved bugs in OpenClaw's ACP subsystem. Here are the key ones affecting multi-agent orchestration:
 
-- OpenClaw >= 2026.3.x（需支持 before_tool_call plugin hook）
+本框架的诞生部分源于 OpenClaw ACP 子系统中尚未修复的 Bug。以下是影响多 Agent 编排的关键问题：
+
+| Issue | Description | Impact | Our Workaround |
+|-------|------------|--------|---------------|
+| [#34054](https://github.com/openclaw/openclaw/issues/34054) | Gateway doesn't call `runtime.close()` for completed oneshot sessions | Zombie sessions accumulate, hit `maxConcurrentSessions` limit | Daily GC in Guardian script ([our comment](https://github.com/openclaw/openclaw/issues/34054#issuecomment-4048248380)) |
+| [#35886](https://github.com/openclaw/openclaw/issues/35886) | ACP child processes not cleaned after TTL | Zombie process accumulation | Guardian health-check auto-restart |
+| [#40243](https://github.com/openclaw/openclaw/issues/40243) | Persistent session agent dies silently | Messages silently dropped | Prefer oneshot over persistent |
+| [#40272](https://github.com/openclaw/openclaw/issues/40272) | `notifyChannel` doesn't work in ACP | No native completion notification | `spawn-interceptor` + `completion-listener` |
+
+For the **#34054 workaround** (zombie session cleanup), see [our detailed comment on GitHub](https://github.com/openclaw/openclaw/issues/34054#issuecomment-4048248380).
+
+---
+
+## Quick Start / 快速开始
+
+### Prerequisites / 前置条件
+
+- OpenClaw >= 2026.3.x (requires `before_tool_call` plugin hook support)
 - Python 3.10+
-- 至少 1 个 Agent 配置
+- At least 1 Agent configured
 
-### 部署 spawn-interceptor plugin
+### Deploy spawn-interceptor plugin / 部署 spawn-interceptor 插件
 
 ```bash
-# 1. 复制 plugin
+# 1. Copy plugin / 复制插件
 cp -r plugins/spawn-interceptor ~/.openclaw/plugins/
 
-# 2. 注册到 openclaw.json
-# 在 plugins.allow 数组中添加 "spawn-interceptor"
-# 在 plugins.entries 中添加 {"spawn-interceptor": {"enabled": true}}
+# 2. Install via OpenClaw CLI / 通过 CLI 安装
+openclaw plugins install --link ~/.openclaw/plugins/spawn-interceptor
 
-# 3. 重启 Gateway
-kill $(pgrep -f openclaw-gateway)
-openclaw gateway start
+# 3. Restart Gateway / 重启 Gateway
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway
+# or: systemctl --user restart openclaw-gateway
 ```
 
-### 部署 completion-listener
+### Deploy completion-listener / 部署 completion-listener
 
 ```bash
-# 添加到 crontab (每分钟检查一次)
+# Add to crontab (check every minute) / 添加到 crontab（每分钟检查）
 echo "*/1 * * * * cd ~/.openclaw/repos/openclaw-multiagent-framework/examples/completion-relay && python3 completion_listener.py --once >> /tmp/completion-relay.log 2>&1" | crontab -
 
-# 或手动运行
+# Or run manually / 或手动运行
 python3 examples/completion-relay/completion_listener.py --loop
 ```
 
-### 验证
+### Verify / 验证
 
 ```bash
-# 触发一个 ACP 任务后，检查 task-log
+# After triggering an ACP task, check the task log
+# 触发一个 ACP 任务后检查 task-log
 tail -f ~/.openclaw/shared-context/monitor-tasks/task-log.jsonl
 ```
 
-详细部署指南见 [QUICKSTART.md](QUICKSTART.md) 和 [GETTING_STARTED.md](GETTING_STARTED.md)。
+See [QUICKSTART.md](QUICKSTART.md) and [GETTING_STARTED.md](GETTING_STARTED.md) for detailed deployment guides.
 
 ---
 
-## 文档导航
+## Documentation / 文档导航
 
-| 文档 | 用途 | 阅读顺序 |
-|------|------|----------|
-| `README.md` | 框架说明（本文档） | 1 |
-| `COMMUNICATION_ISSUES.md` | 通信层问题分析与设计方案 | 2 |
-| `GETTING_STARTED.md` | 接入指引 | 3 |
-| `QUICKSTART.md` | 快速部署指南 | 4 |
-| `AGENT_PROTOCOL.md` | 完整协议规范 | 5 |
-| `ARCHITECTURE.md` | 架构设计（含新通信层） | 6 |
-| `CAPABILITY_LAYERS.md` | 能力分层表 (L1/L2/L3) | 7 |
-| `ANTIPATTERNS.md` | 踩坑实录 | 8 |
-| `TESTING.md` | 测试架构与运行指南 | 9 |
-| `TEMPLATES.md` | 消息和文件模板 | 10 |
-| `INTERNAL_VS_OSS.md` | 开源包 vs 内部运行版差异 | 11 |
-| `CONTRIBUTING.md` | 贡献方式与提交流程 | 12 |
+| Document | Purpose | Order |
+|----------|---------|-------|
+| `README.md` | Overview (this file) | 1 |
+| `COMMUNICATION_ISSUES.md` | Problem analysis & design rationale | 2 |
+| `GETTING_STARTED.md` | Onboarding guide | 3 |
+| `QUICKSTART.md` | Quick deployment guide | 4 |
+| `AGENT_PROTOCOL.md` | Full protocol specification | 5 |
+| `ARCHITECTURE.md` | Architecture design (incl. new communication layer) | 6 |
+| `CAPABILITY_LAYERS.md` | Capability tiers (L1/L2/L3) | 7 |
+| `ANTIPATTERNS.md` | Pitfalls & lessons learned | 8 |
+| `TESTING.md` | Test architecture & how to run | 9 |
+| `TEMPLATES.md` | Message & file templates | 10 |
+| `INTERNAL_VS_OSS.md` | OSS package vs internal deployment diff | 11 |
+| `CONTRIBUTING.md` | How to contribute | 12 |
+| `RELEASE_NOTES.md` | Version history | 13 |
 
 ---
 
-## 仓库结构
+## Repository Structure / 仓库结构
 
 ```
 .
-├── COMMUNICATION_ISSUES.md    # 通信层问题分析与设计方案（核心文档）
-├── AGENT_PROTOCOL.md          # 协作协议规范
-├── ARCHITECTURE.md            # 架构设计
-├── CAPABILITY_LAYERS.md       # 能力分层 (L1/L2/L3)
-├── ANTIPATTERNS.md            # 踩坑实录
+├── COMMUNICATION_ISSUES.md    # Communication layer analysis & design (core doc)
+├── AGENT_PROTOCOL.md          # Collaboration protocol spec
+├── ARCHITECTURE.md            # Architecture design
+├── CAPABILITY_LAYERS.md       # Capability tiers (L1/L2/L3)
+├── ANTIPATTERNS.md            # Pitfalls & lessons learned
 ├── plugins/
-│   └── spawn-interceptor/     # OpenClaw plugin — 自动任务追踪
-│       ├── index.js           # Plugin 实现 (before_tool_call + subagent_ended)
+│   └── spawn-interceptor/     # OpenClaw plugin — auto task tracking
+│       ├── index.js           # Plugin (before_tool_call + subagent_ended hooks)
 │       ├── package.json
+│       ├── openclaw.plugin.json
 │       └── README.md
 ├── examples/
-│   ├── completion-relay/      # 完成通知监听器
+│   ├── completion-relay/      # Completion notification listener
 │   │   ├── completion_listener.py
 │   │   ├── tests/
 │   │   └── README.md
-│   ├── l2_capabilities.py     # L2 能力演示代码
-│   └── protocol_messages.py   # 协议消息格式演示
+│   ├── l2_capabilities.py     # L2 capability demo
+│   └── protocol_messages.py   # Protocol message format demo
 └── ...
 ```
 
 ---
 
-## 设计哲学
+## Design Philosophy / 设计哲学
 
+> **If a behavior is mandatory, it should not be optional.**
+>
 > **如果一个行为是强制的，它就不应该是可选的。**
 
-旧方案要求 Agent "记住"用 wrapper 注册 watcher（文档约束）。
-新方案用 plugin hook 自动拦截（系统约束）。
+The old approach required agents to "remember" to register with the watcher via a wrapper function (documentation constraint). The new approach uses plugin hooks to intercept automatically (system constraint).
 
-详见 [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) 第 6 节。
+旧方案要求 Agent "记住"用 wrapper 注册 watcher（文档约束）。新方案用 plugin hook 自动拦截（系统约束）。
+
+See [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) §6 for details.
 
 ---
 
-## 许可证
+## License / 许可证
 
 MIT License
 
-## 贡献
+## Contributing / 贡献
+
+PRs and Issues welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 欢迎 PR 和 Issue。详见 [CONTRIBUTING.md](CONTRIBUTING.md)。

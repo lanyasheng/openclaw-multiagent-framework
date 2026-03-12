@@ -193,7 +193,7 @@ silent_until_terminal: true
 | `failed` | 失败 | ✅ 是 |
 | `timeout` | 超时 | ✅ 是 |
 
-**注意**：watcher 检测终态时只看 `state` 字段是否为 `completed`/`failed`/`timeout`。
+**注意**：`completion-listener` 和 `spawn-interceptor` 检测终态时只看 `state` 字段是否为 `completed`/`failed`/`timeout`。
 
 ---
 
