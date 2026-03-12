@@ -41,10 +41,9 @@ git clone https://github.com/lanyasheng/openclaw-multiagent-framework.git
 
 ```bash
 # 复制 plugin 到 OpenClaw plugins 目录
-cp -r openclaw-multiagent-framework/plugins/spawn-interceptor ~/.openclaw/plugins/
+cp -r openclaw-multiagent-framework/plugins/spawn-interceptor ~/.openclaw/extensions/
 
 # 用 openclaw CLI 安装（需要 --link 保持本地联动）
-openclaw plugins install --link ~/.openclaw/plugins/spawn-interceptor
 
 # 重启 Gateway
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.gateway

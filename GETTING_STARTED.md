@@ -34,8 +34,7 @@
 ### 1. 安装 spawn-interceptor plugin
 
 ```bash
-cp -r plugins/spawn-interceptor ~/.openclaw/plugins/
-openclaw plugins install --link ~/.openclaw/plugins/spawn-interceptor
+cp -r plugins/spawn-interceptor ~/.openclaw/extensions/
 # 重启 Gateway
 ```
 

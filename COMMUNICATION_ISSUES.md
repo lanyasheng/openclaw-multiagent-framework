@@ -1,7 +1,7 @@
 # 通信层重新设计方案
 
-> Version: 2026-03-12-v1
-> Status: 设计稿
+> Version: 2026-03-13-v2
+> Status: 已实施 (spawn-interceptor v2.4)
 > 目标: 解决 OpenClaw 多 Agent 通信的三大痛点，用最小改动量实现可靠的异步通信
 
 ---
@@ -22,7 +22,7 @@ Agent 调用 sessions_spawn(runtime="acp", task="分析报告")
 → 用户: "任务做完了吗？" → Agent: "我看看..."
 ```
 
-**根因**: OpenClaw 的 `notifyChannel` 参数在 ACP runtime 下不被转发。PR #40279 提供了 opt-in 修复，但仍不覆盖所有场景（Issue #41988）。
+**根因**: OpenClaw 的 `notifyChannel` 参数在 ACP runtime 下不被转发。PR #40273 提供了 opt-in 修复，但仍不覆盖所有场景（Issue #41988）。
 
 **影响**: 无法知道 ACP 任务是否完成。
 
@@ -328,7 +328,7 @@ def check_completion_relay():
 - ✅ 验证当前版本是否支持 before_tool_call plugin
 - ✅ 在 ACP prompt 中测试 completion relay（最小方案）
 - ✅ 关注 Issue #40272, #28053, #41988 的修复进度
-- ✅ 用 PR #40279 的 opt-in 配置 `acp.dispatch.nonThreadedCompletionToParent` 试试
+- ✅ 用 PR #40273 的 opt-in 配置 `acp.dispatch.nonThreadedCompletionToParent` 试试
 
 ### 6.4 设计哲学转变
 
