@@ -6,7 +6,10 @@
 
 > Version: 2026-03-13-v9
 
-> **See also**: [Positioning: Why This Approach](README.md#positioning-why-this-approach-now) — our design philosophy and comparison with mainstream frameworks (AutoGen Core, LangGraph, CrewAI).
+> **See also**:
+> - [Positioning: Why This Approach](README.md#positioning-why-this-approach-now) — our design philosophy and comparison with mainstream frameworks (AutoGen Core, LangGraph, CrewAI)
+> - [DOCS_MAP.md](DOCS_MAP.md) — recommended reading order
+> - [COMPLETION_TRUTH_MATRIX.md](COMPLETION_TRUTH_MATRIX.md) — runtime completion sources and fallback chains
 
 ---
 

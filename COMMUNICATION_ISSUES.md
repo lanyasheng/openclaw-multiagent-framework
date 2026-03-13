@@ -1,4 +1,4 @@
-# 通信层重新设计方案
+# 通信层设计与演化
 
 > Version: 2026-03-13-v9
 > Status: 已实施 (spawn-interceptor v2.4)
@@ -7,360 +7,231 @@
 > **See also**:
 > - [Positioning](README.md#positioning-why-this-approach-now) — our design philosophy
 > - [Framework Comparison](README.md#what-we-borrowed-from-mainstream-frameworks) — comparison with AutoGen Core, LangGraph, CrewAI
+> - [Completion Truth Matrix](COMPLETION_TRUTH_MATRIX.md) — runtime completion sources and fallbacks
 
 ---
 
-## 1. 问题陈述
+## 文档结构
 
-### 1.1 我们遇到了什么
+| Section | Purpose | For Whom |
+|---------|---------|----------|
+| [Current Recommended Architecture](#current-recommended-architecture) | 当前生产环境使用的四层完成检测链路 | **新读者从这里开始** |
+| [Historical Problems & Evolution](#historical-problems--evolution) | 问题背景与方案演化历史 | 想了解"为什么这样设计" |
+| [Deprecated Paths](#deprecated-paths) | 已废弃的旧方案及废弃原因 | 维护旧代码或迁移参考 |
+
+---
+
+## Current Recommended Architecture
+
+当前生产环境使用的四层完成检测架构（v2.5）：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETION DETECTION PIPELINE v2.5                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  LAYER 1: Native Event Stream (OpenClaw)                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  sessions_spawn(runtime="acp", streamTo="parent")                  │   │
+│  │  • Receives progress, stall, resumed events                        │   │
+│  │  • Real-time status updates via stream                             │   │
+│  │  • Covers: runtime=acp with streamTo                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  LAYER 2: Registration Layer (spawn-interceptor)                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  before_tool_call hook intercepts sessions_spawn                    │   │
+│  │  • Records task to task-log.jsonl (spawning)                       │   │
+│  │  • Stores in pendingTasks Map                                       │   │
+│  │  • NOT completion truth — only start registration                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  LAYER 3: Basic Completion (Poller + Reaper)                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  L3a: ACP Session Poller (~15s)                                     │   │
+│  │       Polls ~/.acpx/sessions/ for closed sessions                  │   │
+│  │                                                                     │   │
+│  │  L3b: Stale Reaper (30min safety net)                               │   │
+│  │       Marks long-pending tasks as timeout                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  LAYER 4: Terminal-State Correction (content-aware-completer)              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Solves "Registered=False, Terminal=False" (Type 4 tasks)          │   │
+│  │  • Tier 1: Requires BOTH session closed + content evidence         │   │
+│  │  • Rejects historical files, empty files                           │   │
+│  │  • Idempotent writes, UTC timezone safe                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│                    Unified: task-log.jsonl                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 核心组件（当前主线）
+
+| Component | Layer | Purpose | Status |
+|-----------|-------|---------|--------|
+| `spawn-interceptor` plugin | L2 | Auto-intercept sessions_spawn, log to task-log | **Production** |
+| ACP Session Poller | L3a | Poll `~/.acpx/sessions/` every ~15s | **Production** |
+| Stale Reaper | L3b | 30min safety net for stuck tasks | **Production** |
+| content-aware-completer | L4 | Content evidence validation | **Production** |
+| completion-listener | - | Notification relay (optional) | **Production** |
+
+### 关键澄清
+
+| Misconception | Reality |
+|--------------|---------|
+| "Hook is completion truth" | Hook only registers task **START**. Completion needs Layer 3/4. |
+| "Intermediate states from hook" | Intermediate states come from Layer 1 native event stream, not hook. |
+| "Plugin auto-closes loop" | Plugin enables tracking. Content-aware completer validates completion. |
+
+---
+
+## Historical Problems & Evolution
+
+### Phase 1: Initial Problems (Pre-2026-03)
 
 在运行 8 个 Agent 的生产环境中（main/trading/ainews/macro/codex/claude/butler/content），我们遇到了三个核心通信问题：
 
-#### 问题 A：ACP 完成通知不可靠
+#### Problem A: ACP Completion Notification Unreliable
 
 ```
-Agent 调用 sessions_spawn(runtime="acp", task="分析报告")
-→ ACP 子 Agent 执行 30 分钟
-→ 执行完成
-→ ❌ 没有任何通知回到主 Agent 或用户
-→ 用户: "任务做完了吗？" → Agent: "我看看..."
+Agent calls sessions_spawn(runtime="acp", task="分析报告")
+→ ACP sub-agent executes for 30 minutes
+→ Execution completes
+→ ❌ No notification back to main agent or user
+→ User: "Is it done?" → Agent: "Let me check..."
 ```
 
-**根因**: OpenClaw 的 `notifyChannel` 参数在 ACP runtime 下不被转发。PR #40273 提供了 opt-in 修复，但仍不覆盖所有场景（Issue #41988）。
+**Root cause**: OpenClaw's `notifyChannel` parameter is not forwarded in ACP runtime (Issue #40272).
 
-**影响**: 无法知道 ACP 任务是否完成。
-
-#### 问题 B：sessions_spawn 的 timeout 语义模糊
+#### Problem B: sessions_spawn Timeout Ambiguity
 
 ```
 result = sessions_spawn(task="发帖", runTimeoutSeconds=120)
 → result.status = "timeout"
 
-这意味着什么？
-  a) 任务超时，失败了？
-  b) 等待超时，但任务还在后台跑？
-  c) 投递成功，但没等到结果？
-  d) 投递失败？
+What does this mean?
+  a) Task timed out and failed?
+  b) Wait timed out but task still running?
+  c) Delivered successfully but no result?
+  d) Delivery failed?
 
-答案: 都有可能。无法区分。
+Answer: Could be any. Cannot distinguish.
 ```
 
-**根因**: OpenClaw 的 `sessions_send` / `sessions_spawn` 返回值只有 `ok` 和 `timeout` 两种状态（Issue #28053），没有 `delivered` / `processing` / `completed` 的语义拆分。
+**Root cause**: OpenClaw's `sessions_send` / `sessions_spawn` only returns `ok` and `timeout` (Issue #28053).
 
-**影响**: 主 Agent 无法判断任务的真实状态，只能猜。
+#### Problem C: Agent Says Done But Actually Didn't
 
-#### 问题 C：Agent 说做了但实际没做
+**Root cause**: LLM "muscle memory" points to L1 native tools (sessions_spawn), doesn't remember to use L2 wrapper scripts first. "Documentation constraint ≠ System constraint".
+
+### Phase 2: Task-Callback-Bus Compensation (Deprecated)
+
+To compensate for these issues, we built `task-callback-bus`:
+
+| Component | Lines | Purpose |
+|-----------|-------|---------|
+| bus.py | 467 | Event bus core |
+| stores.py | 431 | JSONL task storage |
+| models.py | 263 | Data models |
+| adapters.py | 1,127 | Multi-type task adapters |
+| notifiers.py | 902 | Notification sending |
+| completion_bus.py | 507 | Completion event bus |
+| completion_consumer.py | 506 | Completion event consumer |
+| terminal_bridge.py | 451 | Terminal→follow-up bridge |
+| discord_panel_bridge.py | 488 | Discord panel bridge |
+| dead_letter_queue.py | 271 | Dead letter queue |
+| deduplicator.py | 100 | Deduplicator |
+| agent_comm_guardrail.py | 383 | ACK guardrail |
+| Others | ~2,700 | Various helpers |
+| **Total** | **~2,543** | — |
+
+**Problems**: High complexity, watcher reporting degraded, 0 actual notifications sent, all owners unknown.
+
+### Phase 3: Plugin-Based Solution (Current v2.5)
+
+**Core insight**: If a behavior is mandatory, it should be a system constraint — not a documentation constraint.
+
+**Evolution timeline**:
+
+| Version | Approach | Key Learning |
+|---------|----------|--------------|
+| v1.x | task-callback-bus | File polling is industry anti-pattern; too complex |
+| v2.0 | acp-completion-relay (prompt injection) | ACP agents ignore callback instructions in prompt |
+| v2.1 | subagent_ended hook | Hook doesn't fire for ACP runtime (OpenClaw bug) |
+| v2.2 | sessions/index.json polling | Works but delay too high (5 min) |
+| v2.3 | ACP session poller (~15s) | **Working solution** — poll `~/.acpx/sessions/` |
+| v2.4 | spawn-interceptor + poller + reaper | **Current production** — four-layer pipeline |
+| v2.5 | + content-aware-completer | **Latest** — content evidence validation |
+
+### Design Philosophy Shift
 
 ```
-用户: "帮我发个小红书"
-Agent: "好的，我已经启动发帖任务并设置了监控。"
+Old approach: Agent obligated to register watcher (documentation constraint)
+        → Agent forgets → patch Agent protocol → still forgets → add more code
+        → Complexity spiral
 
-实际发生了什么:
-  ✅ sessions_spawn 调用了（发帖开始了）
-  ❌ watcher 注册没做（说了但忘了）
-  ❌ 完成回调没有（因为没注册）
-  → 用户永远不会收到发帖结果通知
+New approach: System obligated to track tasks (infrastructure constraint)
+        → Agent just spawns → hook auto-tracks → prompt auto-injects callback
+        → Zero extra code, zero cognitive burden
 ```
 
-**根因**: LLM 的"肌肉记忆"指向 L1 原生工具（sessions_spawn），不会主动记住用 L2 的 wrapper 脚本先注册 watcher。"文档约束 ≠ 系统约束"。
-
-**影响**: 任务"黑洞"——启动了但没人跟踪。
-
-### 1.2 当前补偿方案的代价
-
-为了补偿这三个问题，我们自建了 `task-callback-bus`：
-
-| 组件 | 行数 | 用途 |
-|------|------|------|
-| bus.py | 467 | 事件总线核心 |
-| stores.py | 431 | JSONL 任务存储 |
-| models.py | 263 | 数据模型 |
-| adapters.py | 1,127 | 多类型任务适配 |
-| notifiers.py | 902 | 通知发送 |
-| completion_bus.py | 507 | 完成事件总线 |
-| completion_consumer.py | 506 | 完成事件消费 |
-| terminal_bridge.py | 451 | 终端→follow-up 桥接 |
-| discord_panel_bridge.py | 488 | Discord 面板桥接 |
-| dead_letter_queue.py | 271 | 死信队列 |
-| deduplicator.py | 100 | 去重器 |
-| agent_comm_guardrail.py | 383 | ACK 守门 |
-| 其他 | ~2,700 | 各种辅助 |
-| **合计** | **~2,543** | — |
-
-加上 13 个脚本文件，每 5 分钟 cron 轮询，以及 ~1,000 行协议文档。
-
-**问题**: 复杂度高、watcher 报 degraded、通知实际发送 0 条、owner 全 unknown。
-
-### 1.3 行业对比
-
-| 方案 | 代码量 | 问题 |
-|------|--------|------|
-| ggondim (Lobster) | ~300 行 | 只解决同步编排，不解决异步监控 |
-| MFS Corp (Discord) | ~0 行 | 不用 ACP，不需要异步回调 |
-| **我们 (callback_bus)** | **~2,543 行 (v1.1.0, 含 DLQ/Terminal Bridge/Guardrail)** | 三个痛点的完整补偿 |
-| **本方案目标** | **~800 行** | 用 plugin hook 做自动化，砍掉轮询 |
+> **Core principle**: If a behavior is mandatory, it shouldn't be optional.
 
 ---
 
-## 2. 设计目标
+## Deprecated Paths
 
-1. **可靠的完成通知**: ACP 任务完成后，主 Agent 和用户必须收到通知
-2. **明确的任务状态**: 消除 timeout 的歧义，提供清晰的状态追踪
-3. **零认知负担**: Agent 不需要记住额外步骤，系统自动处理注册和回调
-4. **最小代码量**: 从 2,543 行降到 ~800 行
-5. **与开源框架集成**: 方案可直接在 github 仓库中使用
+### Deprecated: Task-Callback-Bus v1.x
+
+**Status**: Deprecated, do not use for new code
+
+**Why deprecated**:
+- 2,543 lines of complexity
+- File polling is industry anti-pattern
+- Notification reliability issues
+- Replaced by spawn-interceptor plugin (v2.4+)
+
+**Migration path**:
+```
+Old: wrapper script → tasks.jsonl → cron(5min) → file scan → notifier
+New: sessions_spawn → [hook auto-intercept] → ACP → sessions/index.json poller → task-log
+```
+
+### Deprecated: ACP Completion Relay (Prompt Injection) v2.0
+
+**Status**: Deprecated approach
+
+**Why deprecated**:
+- ACP oneshot agents exit immediately after main task, ignoring callback instructions
+- Not reliable enough for production
+- Replaced by ACP session poller (v2.3+)
+
+**Note**: Prompt injection is still used in some contexts, but not relied upon as primary completion mechanism.
+
+### Deprecated: subagent_ended Hook v2.1
+
+**Status**: Deprecated due to OpenClaw bug
+
+**Why deprecated**:
+- `subagent_ended` hook does not fire for ACP runtime (OpenClaw issue)
+- Replaced by explicit session polling (v2.3+)
 
 ---
 
-## 3. 架构设计
+## Version History
 
-### 3.1 核心思路：拦截 + 自愈
-
-```
-                      当前方案                          新方案
-                      ────────                          ────────
-Agent 调用 sessions_spawn      Agent 调用 sessions_spawn
-         ↓                              ↓
-wrapper 脚本注册 watcher        before_tool_call hook 自动拦截
-(Agent 经常忘记)                (系统层面，不可绕过)
-         ↓                              ↓
-cron 每 5 分钟轮询               ACP 内嵌完成回调
-(文件轮询，延迟高)              (任务完成时主动推送)
-         ↓                              ↓
-通知 (经常 0 条)                sessions_send 回推结果
-                                (确定性，可追溯)
-```
-
-### 3.2 三层方案
-
-#### Layer 1: `acp-completion-relay` — 解决 "ACP 完成不通知"
-
-**原理**: 在 ACP 任务的 prompt 末尾自动注入一段指令，要求 ACP 子 Agent 在完成时用 `sessions_send` 主动通知父 Agent。
-
-```
-ACP 任务原始 prompt:
-  "分析这段代码的性能瓶颈..."
-
-自动注入到 prompt 末尾:
-  "\n\n[COMPLETION RELAY]\n
-  当你完成任务后，必须执行以下命令通知结果：
-  sessions_send(sessionKey='agent:main:completion-relay',
-    message=JSON.stringify({
-      type: 'acp_completion',
-      taskId: '<auto-generated>',
-      status: 'completed|failed',
-      summary: '<一句话总结>',
-      reportFile: '<报告文件路径>'
-    })
-  )"
-```
-
-**为什么这行得通**:
-- ACP 子 Agent 是一个完整的 LLM 实例，有 `sessions_send` 工具
-- 在 prompt 中注入的指令，ACP 会高优先级执行（因为在系统提示里）
-- 不依赖 OpenClaw Core 的 notifyChannel 机制
-- 不需要 watcher 轮询
-
-**局限性**:
-- 依赖 ACP Agent 遵循 prompt 指令（LLM 不是 100% 可靠）
-- 需要 ACP Agent 有 `sessions_send` 工具权限
-
-#### Layer 2: `spawn-interceptor` — 解决 "Agent 说做了但没做"
-
-**原理**: 用 OpenClaw 的 `before_tool_call` plugin hook 拦截所有 `sessions_spawn` 调用，自动完成注册和追踪。
-
-```javascript
-// spawn-interceptor plugin (Node.js)
-export const hooks = {
-  before_tool_call: async (event) => {
-    const { toolName, params, agentId } = event;
-    
-    // 只拦截 sessions_spawn
-    if (toolName !== 'sessions_spawn') return {};
-    
-    const taskId = `tsk_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-    
-    // 1. 记录到任务追踪文件
-    await appendToTaskLog({
-      taskId,
-      agentId,
-      runtime: params.runtime || 'subagent',
-      task: (params.task || '').substring(0, 200),
-      timestamp: new Date().toISOString(),
-      status: 'spawning'
-    });
-    
-    // 2. 如果是 ACP，注入完成回调到 prompt
-    if (params.runtime === 'acp') {
-      const relay = buildCompletionRelay(taskId, agentId);
-      params.task = params.task + relay;
-    }
-    
-    // 3. 返回修改后的参数
-    return { params };
-  }
-};
-```
-
-**效果**:
-- Agent 继续用 `sessions_spawn`（肌肉记忆完全保留）
-- 系统自动注册任务 + 注入回调
-- 零认知负担
-
-#### Layer 3: `completion-listener` — 解决 "timeout 语义模糊"
-
-**原理**: 创建一个专用 session `agent:main:completion-relay`，监听所有 ACP 完成回调。
-
-```
-ACP 完成 → sessions_send 到 completion-relay session
-         → completion-listener 解析消息
-         → 更新 task-log 状态
-         → 通知用户（Discord/Telegram）
-         → 生成 follow-up（如果需要）
-```
-
-实现为一个简单的 cron 任务或 hook：
-
-```python
-# completion_listener.py (~100 行)
-"""
-监听 completion-relay session 中的完成消息。
-作为 cron 每 1 分钟运行一次（比 5 分钟的 watcher 更快，
-但只检查一个 session 而不是扫描文件系统）。
-"""
-
-def check_completion_relay():
-    # 读取 completion-relay session 的最新消息
-    # 解析 JSON 格式的完成通知
-    # 更新 task-log
-    # 发送 Discord/用户通知
-    pass
-```
-
-### 3.3 数据流对比
-
-```
-当前方案:
-  Agent → wrapper → tasks.jsonl → cron(5min) → 扫描 status_file → notifier → Discord
-  (5 步, 最坏延迟 5 分钟, 2,543 行代码)
-
-新方案:
-  Agent → [hook 自动拦截] → sessions_spawn(+注入回调) → ACP → sessions_send(完成) → listener → Discord
-  (3 步, 延迟 < 30 秒, ~800 行代码)
-```
-
-### 3.4 代码量预估
-
-| 组件 | 行数 | 对应替换 |
-|------|------|----------|
-| spawn-interceptor (plugin, JS) | ~150 | 替换 spawn_acp_with_watcher.py + adapters.py + stores.py |
-| completion-relay (prompt 模板) | ~30 | 替换 completion_bus.py + completion_consumer.py |
-| completion-listener (Python) | ~200 | 替换 watcher cron + notifiers.py + terminal_bridge.py |
-| task-log (models + store) | ~150 | 替换 models.py + stores.py (精简版) |
-| 配置文件 | ~50 | openclaw.json plugin 配置 |
-| 测试 | ~250 | 新增测试 |
-| **合计** | **~830** | **替换 2,543 行** |
+| Version | Date | Changes |
+|---------|------|---------|
+| v1.x | 2026-03-12 | Initial task-callback-bus implementation |
+| v2.0 | 2026-03-12 | acp-completion-relay with prompt injection |
+| v2.1 | 2026-03-12 | subagent_ended hook attempt |
+| v2.2 | 2026-03-12 | sessions/index.json polling |
+| v2.3 | 2026-03-13 | ACP session poller (~15s) |
+| v2.4 | 2026-03-13 | spawn-interceptor + four-layer pipeline |
+| v2.5 | 2026-03-13 | + content-aware-completer (L4) |
 
 ---
 
-## 4. 实施计划
-
-### Phase 1: 基础设施 (Day 1)
-
-1. 创建 `spawn-interceptor` plugin 骨架
-2. 实现 `before_tool_call` hook 的 task-log 记录
-3. 实现 completion-relay prompt 模板
-4. 编写单元测试
-
-### Phase 2: 集成 (Day 2)
-
-1. 在 openclaw.json 中注册 plugin
-2. 创建 `completion-relay` session
-3. 实现 `completion-listener`
-4. 端到端测试
-
-### Phase 3: 迁移 (Day 3)
-
-1. 并行运行新旧方案
-2. 对比通知可靠性
-3. 确认无遗漏后停用 watcher cron
-4. task-callback-bus v1.1.0 已完成精简 (WatcherBus + DLQ + Terminal Bridge + Guardrail, 共 2,543 行)
-
----
-
-## 5. 风险与缓解
-
-| 风险 | 影响 | 缓解 |
-|------|------|------|
-| ACP Agent 不遵循 prompt 回调指令 | 部分任务无完成通知 | **已验证**: ACP 确实忽略回调。v2.4 改用 ACP session poller |
-| `subagent_ended` 不对 ACP runtime 触发 | ACP 任务永远卡在 spawning | **已验证并修复**: v2.4 ACP session poller 轮询 ~/.acpx/sessions/ |
-| before_tool_call hook 尚未完全 wired (Issue #5943) | Plugin 不生效 | **已验证**: 当前版本 hook 正常工作 |
-| sessions_send 到 completion-relay 也 timeout | 通知丢失 | 不再依赖此路径，ACP session poller 为主 |
-| OpenClaw 升级导致 plugin API 变化 | Plugin 失效 | 锁定 API 版本，升级前测试 |
-
-### Fallback 策略
-
-如果 before_tool_call plugin 当前版本不可用，方案降级为：
-
-```
-完整方案 (v2.4):  Plugin hook + ACP session poller + Stale reaper + Listener
-降级方案:          Plugin hook + Stale reaper (无 poller, 30min 超时收割)
-最小方案:          Prompt 注入 (ACP 可能忽略) + 人工检查
-```
-
-**v2.4 验证结论**: Prompt 注入回调是不可靠的（ACP oneshot agent 完成主任务后直接退出），`subagent_ended` hook 不对 ACP 触发。真正可靠的检测方式是轮询 `~/.acpx/sessions/` 的 `closed` 字段。
-
----
-
-## 6. 与 Zoe 的对齐要点
-
-### 6.1 Zoe 需要知道的关键信息
-
-1. **你们的 2,543 行 watcher 代码是在补偿 OpenClaw ACP 的已知 Bug (Issue #40272)**
-2. **文件轮询是行业公认的反模式**——社区没有人这么做
-3. **OpenClaw 已有 before_tool_call hook**——可以实现零认知负担的自动注册
-4. **最关键的改变**：不再要求 Agent "记住用 wrapper"，改为系统自动拦截
-
-### 6.2 Zoe 需要停止做的
-
-- ❌ 继续在 task-callback-bus 上增加功能（如 acp_guard.py, dispatch_consumer.py 等）
-- ❌ 继续优化文件轮询的性能
-- ❌ 继续强化 AGENT_PROTOCOL.md 中的文档约束
-
-### 6.3 Zoe 需要开始做的
-
-- ✅ 验证当前版本是否支持 before_tool_call plugin
-- ✅ 在 ACP prompt 中测试 completion relay（最小方案）
-- ✅ 关注 Issue #40272, #28053, #41988 的修复进度
-- ✅ 用 PR #40273 的 opt-in 配置 `acp.dispatch.nonThreadedCompletionToParent` 试试
-
-### 6.4 设计哲学转变
-
-```
-旧思路: Agent 有义务注册 watcher（文档约束）
-        → Agent 忘记 → 补 Agent 协议 → 还是忘记 → 补更多代码
-        → 复杂度螺旋上升
-
-新思路: 系统有义务追踪任务（基础设施约束）
-        → Agent 只管 spawn → hook 自动追踪 → prompt 自动注入回调
-        → 零额外代码，零认知负担
-```
-
-> **核心原则**: 如果一个行为是强制的，它就不应该是可选的。
-
----
-
-## 7. 开源框架更新计划
-
-本方案需要在 `openclaw-multiagent-framework` 仓库中做以下更新：
-
-1. 新增 `plugins/spawn-interceptor/` — 完整的 plugin 实现
-2. 新增 `examples/completion-relay/` — 完成回调的演示
-3. 更新 `ARCHITECTURE.md` — 新增通信层设计说明
-4. 更新 `CAPABILITY_LAYERS.md` — 调整 L2 能力描述
-5. 更新 `ANTIPATTERNS.md` — 新增"文件轮询 vs 事件驱动"
-6. 新增 `COMMUNICATION_ISSUES.md` — 本文档（问题分析 + 方案）
-
----
-
-*设计者: openclaw-multiagent-framework | 2026-03-12**
+*Last updated: 2026-03-13 | See [Completion Truth Matrix](COMPLETION_TRUTH_MATRIX.md) for runtime completion sources*

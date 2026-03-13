@@ -587,9 +587,11 @@ sessions_spawn(
 
 | Document | Purpose |
 |----------|---------|
+| [DOCS_MAP.md](DOCS_MAP.md) | **Start here** — recommended reading order for new readers |
 | [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) | Problem analysis & design rationale (start here after README) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Architecture deep-dive with data flow diagrams |
 | [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) | Full collaboration protocol specification |
+| [COMPLETION_TRUTH_MATRIX.md](COMPLETION_TRUTH_MATRIX.md) | Runtime completion sources and fallback chains |
 | [CAPABILITY_LAYERS.md](CAPABILITY_LAYERS.md) | L1 (OpenClaw native) / L2 (framework) / L3 (needs core changes) |
 | [CONTENT_AWARE_COMPLETER.md](CONTENT_AWARE_COMPLETER.md) | Layer 4 completion validation documentation |
 | [QUICKSTART.md](QUICKSTART.md) | Detailed deployment guide |
