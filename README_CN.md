@@ -591,6 +591,7 @@ sessions_spawn(
 | [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) | 问题分析和设计原理（README 之后首选阅读） |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 架构深度解析，含数据流图 |
 | [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) | 完整的协作协议规范 |
+| [ROUNDTABLE_PROTOCOL.md](ROUNDTABLE_PROTOCOL.md) | 多 Agent 圆桌讨论共享频道规则 |
 | [COMPLETION_TRUTH_MATRIX.md](COMPLETION_TRUTH_MATRIX.md) | 运行时完成真值来源和降级路径 |
 | [CAPABILITY_LAYERS.md](CAPABILITY_LAYERS.md) | L1（OpenClaw 原生）/ L2（框架增强）/ L3（需要核心修改） |
 | [CONTENT_AWARE_COMPLETER.md](CONTENT_AWARE_COMPLETER.md) | 第4层完成验证文档 |

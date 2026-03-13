@@ -8,6 +8,7 @@
 > - [Positioning](README.md#positioning-why-this-approach-now) — our design philosophy
 > - [Framework Comparison](README.md#what-we-borrowed-from-mainstream-frameworks) — comparison with AutoGen Core, LangGraph, CrewAI
 > - [Completion Truth Matrix](COMPLETION_TRUTH_MATRIX.md) — runtime completion sources and fallbacks
+> - [Roundtable Protocol](ROUNDTABLE_PROTOCOL.md) — shared-channel discussion rules for multi-agent roundtables
 
 ---
 
