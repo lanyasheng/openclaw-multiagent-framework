@@ -1,33 +1,41 @@
 # completion-relay
 
-Lightweight listener for task completion events from `task-log.jsonl`.
+Lightweight **event consumer** for `task-log.jsonl`.
 
-轻量级任务完成事件监听器，从 `task-log.jsonl` 读取事件。
+轻量级 **事件消费者**，从 `task-log.jsonl` 读取事件并做通知/转发。
 
-## How It Works / 工作原理
+## What It Is / 它是什么
 
-The `completion_listener.py` does **not** detect completion itself. It reads the unified event stream `task-log.jsonl`, which is written by:
+`completion_listener.py` **不负责判断任务是否真的完成**。
 
-`completion_listener.py` **不**自己检测完成。它读取统一事件流 `task-log.jsonl`，该文件由以下组件写入：
+它只做两件事：
+1. 读取 `task-log.jsonl`
+2. 对新的终态事件（如 `completed` / `failed`）做通知
 
-| Writer / 写入者 | Scope / 范围 | Latency / 延迟 |
-|----------------|-------------|----------------|
-| spawn-interceptor `subagent_ended` hook | runtime=subagent | <1s |
-| spawn-interceptor ACP Session Poller | runtime=acp | ~15s |
-| spawn-interceptor Stale Reaper | stuck tasks | 30min |
-| task-callback-bus WatcherBus | external tasks | adapter-driven |
+换句话说，它是 **relay / listener**，不是 completion truth engine。
 
-```
-spawn-interceptor / WatcherBus
-         │  writes events
-         ▼
-  task-log.jsonl
-         │  reads events
-         ▼
-  completion_listener.py
-         │
-         ▼
-  stdout / Discord / Telegram
+## Event Writers / 事件写入者
+
+`task-log.jsonl` 通常由以下组件写入：
+
+| Writer / 写入者 | Role / 角色 |
+|----------------|-------------|
+| `spawn-interceptor` | 启动登记（`spawning`） |
+| ACP Session Poller | 基础终态检测 |
+| Stale Reaper | 超时兜底 |
+| `content-aware-completer` | 终态纠偏（Type 4 task 修复） |
+| optional external bridges | 外部任务接入（可选） |
+
+## Data Flow / 数据流
+
+```text
+writers
+  ↓
+task-log.jsonl
+  ↓
+completion_listener.py
+  ↓
+stdout / webhook / Discord / Telegram / custom sink
 ```
 
 ## Usage / 用法
@@ -36,14 +44,14 @@ spawn-interceptor / WatcherBus
 # Single check / 单次检查
 python3 completion_listener.py --once
 
-# Continuous monitoring (every 30 seconds) / 持续监听
+# Continuous monitoring / 持续监听
 python3 completion_listener.py --loop --interval 30
 
-# Custom task log location / 自定义日志路径
+# Custom task log path / 自定义路径
 python3 completion_listener.py --once --task-log /path/to/task-log.jsonl
 ```
 
-### Cron Setup / 定时任务
+## Cron Example / 定时任务示例
 
 ```bash
 */1 * * * * cd /path/to/completion-relay && python3 completion_listener.py --once >> /tmp/completion-relay.log 2>&1
@@ -51,44 +59,40 @@ python3 completion_listener.py --once --task-log /path/to/task-log.jsonl
 
 ## Event Format / 事件格式
 
-Events in `task-log.jsonl` follow this structure:
-
 ```json
 {
   "taskId": "tsk_20260313_abc123",
   "agentId": "main",
   "runtime": "acp",
   "status": "completed",
-  "completionSource": "acp_session_poller",
+  "completionSource": "content_reconciler",
   "spawnedAt": "2026-03-13T01:30:00.000Z",
   "completedAt": "2026-03-13T01:32:15.000Z"
 }
 ```
 
-Key fields / 关键字段:
+Key fields / 关键字段：
 - `status`: `spawning` → `completed` / `failed` / `timeout`
-- `completionSource`: `subagent_ended` | `acp_session_poller` | `stale_reaper` | `watcher_bus`
+- `completionSource`: e.g. `acp_session_poller` | `stale_reaper` | `content_reconciler`
+
+## Important Notes / 重要说明
+
+- This listener is **append-log consumer logic**, not reconciliation logic.
+- If you need completion correction for false non-terminal tasks, use `content-aware-completer`.
+- If you need retention / archive / quarantine, implement it outside this listener.
 
 ## Extending Notifications / 扩展通知
 
-The `notify()` function currently prints to stdout. To add webhooks:
+The current `notify()` just prints to stdout. You can replace it with webhook or bot delivery:
 
 ```python
-def notify(task_id, status, summary, error=""):
-    log.info(f"[{status}] {task_id}: {summary}")
-    
-    # Discord webhook
-    requests.post(DISCORD_WEBHOOK, json={
-        "content": f"Task {task_id} {status}: {summary}"
-    })
+def notify(task_id, status, task_desc, source, runtime):
+    print(f"[{status}] {task_id} ({runtime}/{source}): {task_desc}")
 ```
 
-## Tests / 测试
+## Minimal Validation / 最小校验
 
 ```bash
-python3 -m pytest tests/ -v
+python3 completion_listener.py --once --task-log /path/to/task-log.jsonl
+python3 -m py_compile completion_listener.py
 ```
-
-15 test cases covering cursor tracking, event parsing, and notification dispatch.
-
-15 个测试用例，覆盖游标追踪、事件解析和通知分发。

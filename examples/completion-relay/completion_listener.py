@@ -1,17 +1,17 @@
 """
-completion_listener.py — Monitors task-log.jsonl for completed/failed tasks and dispatches alerts.
+completion_listener.py — Lightweight consumer for task-log.jsonl.
 
-v2.3 compatible: Reads completion events from task-log.jsonl, which is written by:
-  - spawn-interceptor's subagent_ended hook (runtime=subagent, <1s latency)
-  - spawn-interceptor's ACP Session Poller (runtime=acp, ~15s latency)
-  - spawn-interceptor's Stale Reaper (any runtime stuck >30min)
-  - task-callback-bus WatcherBus (runtime=external, adapter-driven)
+It does NOT determine completion truth itself. It only reads the unified event stream
+and emits notifications for newer terminal events.
 
-This listener doesn't care about the completion source — it just reads task-log.jsonl
-as the single source of truth for all task lifecycle events.
+Typical writers into task-log.jsonl:
+  - spawn-interceptor registration layer (spawning)
+  - ACP Session Poller / Stale Reaper (basic terminal states)
+  - content-aware-completer (terminal-state correction)
+  - optional downstream external-task bridges
 
 Usage:
-    python completion_listener.py --once           # single check
+    python completion_listener.py --once            # single check
     python completion_listener.py --loop            # continuous (every 30s)
     python completion_listener.py --task-log PATH   # custom task log location
 
@@ -23,8 +23,7 @@ import json
 import os
 import time
 import logging
-from datetime import datetime
-from typing import Dict, Set
+from typing import Optional, Set
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +40,9 @@ CURSOR_FILE = os.path.expanduser(
 )
 
 
-def read_task_log(path: str) -> list:
-    entries = []
+def read_task_log(path: str) -> dict:
+    """Read task log and return dict keyed by taskId (latest entry wins)."""
+    entries = {}
     if not os.path.exists(path):
         return entries
     with open(path) as f:
@@ -53,10 +53,69 @@ def read_task_log(path: str) -> list:
             try:
                 entry = json.loads(line)
                 entry["_line"] = line_num
-                entries.append(entry)
+                task_id = entry.get("taskId")
+                if task_id:
+                    entries[task_id] = entry
             except json.JSONDecodeError:
                 continue
     return entries
+
+
+def append_task_log(path: str, entry: dict) -> None:
+    """Append a task entry to the log file (creates parent dirs if needed)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def parse_completion(msg: dict) -> Optional[dict]:
+    """Parse an ACP completion message from various formats.
+
+    Supports:
+      - msg['content'] as JSON string
+      - msg['content'] as dict (already parsed)
+      - msg['text'] as fallback field
+      - JSON embedded in text (extracts first {...} block)
+    """
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if content is None:
+        content = msg.get("text") if isinstance(msg, dict) else None
+
+    if not content:
+        return None
+
+    # If already a dict, use directly
+    if isinstance(content, dict):
+        data = content
+    else:
+        # Try to parse as JSON
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # Try to extract JSON from text
+            text = str(content)
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    data = json.loads(text[start:end+1])
+                except json.JSONDecodeError:
+                    return None
+            else:
+                return None
+
+    if not isinstance(data, dict):
+        return None
+
+    if data.get("type") != "acp_completion":
+        return None
+
+    return {
+        "taskId": data.get("taskId"),
+        "status": data.get("status"),
+        "summary": data.get("summary", ""),
+        "error": data.get("error"),
+    }
 
 
 def get_cursor() -> int:
@@ -91,7 +150,7 @@ def check_once(task_log_path: str) -> dict:
     notified: Set[str] = set()
     max_line = cursor
 
-    for entry in entries:
+    for entry in entries.values():
         line_num = entry.get("_line", 0)
         if line_num <= cursor:
             continue
