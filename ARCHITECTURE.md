@@ -4,7 +4,7 @@
 <!-- 前置: AGENT_PROTOCOL.md -->
 <!-- 后续: TEMPLATES.md -->
 
-> Version: 2026-03-13-v3
+> Version: 2026-03-13-v4
 
 ---
 
@@ -35,13 +35,16 @@
 
 **职责**：长任务执行、状态变化通知、终态回推
 
-**工具**：`spawn-interceptor` plugin + `completion-listener`
+**工具**：四层完成检测链路
 
-**特点**：
-- 适用于 >10 秒的长任务
-- `spawn-interceptor` 自动拦截 `sessions_spawn` 并记录到 task-log（v2.4: 含 ACP session poller + 原子持久化）
-- ACP 任务自动注入完成回调，完成时通过 `sessions_send` 回推结果
-- `completion-listener` 处理通知并更新 task-log 状态
+**四层架构**：
+
+| 层 | 组件 | 职责 | 覆盖场景 |
+|----|------|------|----------|
+| L1 | 原生事件流 | `streamTo="parent"` 实时状态 | ACP runtime |
+| L2 | spawn-interceptor | Hook 拦截、任务登记 | 所有 sessions_spawn |
+| L3 | Poller + Reaper | 基础终态检测 | 会话关闭、超时 |
+| L4 | content-aware-completer | 内容证据验证 | Type 4 任务纠偏 |
 
 ### 3. 共享状态面 (Shared State Plane)
 
@@ -55,11 +58,108 @@ shared-context/
 ├── AGENT_PROTOCOL.md      # 统一协作协议（唯一真值）
 ├── job-status/            # 任务状态追踪
 ├── monitor-tasks/         # task-log.jsonl（plugin 自动写入）
+├── agent-outputs/         # Agent 输出产物（L4 证据来源）
 ├── dispatches/            # 派单记录
 ├── intel/                 # 跨 Agent 情报共享
 ├── followups/             # 每日反思落地追踪
 └── archive/               # 历史文档归档
 ```
+
+---
+
+## 四层完成检测架构详解
+
+### Layer 1: 原生事件流 (OpenClaw Native)
+
+**实现**：`sessions_spawn(streamTo="parent")`
+
+**能力**：
+- 接收 progress、stall、resumed 事件
+- 实时状态更新
+- 无需额外组件
+
+**Agent 使用**：
+```python
+sessions_spawn(
+    sessionKey="agent:worker:task",
+    agentId="worker",
+    prompt="Task description",
+    mode="run",  # 推荐默认值
+    streamTo="parent",  # 启用 L1 事件流
+)
+```
+
+### Layer 2: 启动登记层 (spawn-interceptor)
+
+**实现**：`plugins/spawn-interceptor/index.js`
+
+**职责**：
+- 拦截所有 `sessions_spawn` 调用
+- 记录到 `task-log.jsonl`（spawning 状态）
+- **重要**：只负责启动登记，不是完成真值
+
+**Hook 职责澄清**：
+- Hook 记录任务启动（spawning）
+- Hook 不检测任务完成
+- 完成检测由 L3/L4 负责
+
+### Layer 3: 基础终态层 (Poller + Reaper)
+
+**实现**：`plugins/spawn-interceptor/index.js` (poller + reaper)
+
+**组件**：
+
+| 组件 | 触发条件 | 职责 |
+|------|----------|------|
+| ACP Session Poller | 每 15 秒 | 轮询 `~/.acpx/sessions/` |
+| Stale Reaper | 30 分钟 | 标记超时任务 |
+
+**限制**：
+- 仅检测会话状态（closed/open）
+- 不验证内容证据
+- 可能产生"假完成"（Type 4 任务）
+
+### Layer 4: 终态纠偏层 (content-aware-completer)
+
+**实现**：`examples/content-aware-completer/content_aware_completer.py`
+
+**解决的问题**：Type 4 任务（Registered=False, Terminal=False）
+
+**四层决策规则**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    四层决策矩阵                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Tier 1: 强证据（高置信度）                                 │
+│  • Session closed = true                                    │
+│  • Content evidence present                                 │
+│  → Action: Mark completed                                   │
+│                                                             │
+│  Tier 2: 有状态无内容（中置信度）                           │
+│  • Session closed = true                                    │
+│  • No valid content                                         │
+│  → Action: Keep pending (possible false terminal)          │
+│                                                             │
+│  Tier 3: 有内容无状态（低置信度）                           │
+│  • Content present                                          │
+│  • Session not closed                                       │
+│  → Action: Keep pending (still running)                    │
+│                                                             │
+│  Tier 4: 无证据（低置信度）                                 │
+│  • No session state                                         │
+│  • No content                                               │
+│  → Action: Keep pending                                     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**核心规则**：
+- **历史文件拒绝**：文件创建时间早于任务 5 分钟以上 → 拒绝
+- **空文件拒绝**：文件大小 < MIN_CONTENT_SIZE (10 bytes) → 拒绝
+- **幂等写入**：同一任务多次处理不产生重复日志
+- **UTC 时区安全**：所有时间戳使用 UTC
 
 ---
 
@@ -72,7 +172,7 @@ sequenceDiagram
     participant U as 用户
     participant M as main
     participant A as Agent
-    
+
     U->>M: 请求
     M->>M: ACK（立即）
     M->>A: sessions_send(Request)
@@ -81,28 +181,44 @@ sequenceDiagram
     M->>U: 结果
 ```
 
-### 长任务流程（> 10 秒）— 拦截 + 回调架构
+### 长任务流程（> 10 秒）— 四层链路架构
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
     participant M as main
     participant P as spawn-interceptor
+    participant L1 as L1: Event Stream
     participant ACP as ACP Agent
-    participant L as completion-listener
-    
+    participant L3 as L3: Poller/Reaper
+    participant L4 as L4: Content-Aware
+
     U->>M: 请求
     M->>M: ACK（立即）
-    M->>M: sessions_spawn(acp)
-    P->>P: hook 拦截: 记录 task-log + 注入回调
-    M->>ACP: ACP 启动（含回调指令）
-    note over ACP: 异步执行任务
-    ACP->>ACP: 任务完成 → acpx session closed
-    note over P: ACP session poller (15s interval)
-    P->>P: 检测 ~/.acpx/sessions/ closed=true
-    P->>P: 更新 task-log (completed)
-    L->>L: 监听 task-log.jsonl 新完成记录
-    L->>U: 通知（stdout/Discord/Telegram）
+    M->>M: sessions_spawn(acp, streamTo="parent")
+    P->>P: L2: hook 拦截，记录 task-log
+    M->>ACP: ACP 启动
+
+    loop L1: 实时事件流
+        ACP->>L1: progress/stall/resumed
+        L1->>M: 实时状态更新
+    end
+
+    note over ACP: 任务完成
+    ACP->>ACP: acpx session closed
+
+    loop L3: 轮询检测 (~15s)
+        L3->>L3: 检测 ~/.acpx/sessions/
+        L3->>P: 更新 task-log (基础终态)
+    end
+
+    loop L4: 内容验证
+        L4->>L4: 检查 agent-outputs/
+        L4->>L4: 验证内容证据
+        L4->>P: 更新 task-log (终态确认)
+    end
+
+    M->>U: 最终通知
 ```
 
 ### 数据流总览
@@ -132,16 +248,26 @@ flowchart TB
         A3[Agent C]
     end
 
-    subgraph Plugin["spawn-interceptor plugin"]
-        P1[拦截 sessions_spawn]
-        P2[记录 task-log.jsonl]
-        P3[注入完成回调]
+    subgraph L1["L1: 原生事件流"]
+        L1_1[streamTo="parent"]
+        L1_2[progress/stall/resumed]
     end
 
-    subgraph Listener["completion-listener"]
-        L1[监听 completion session]
-        L2[解析完成通知]
-        L3[更新 task-log + 通知]
+    subgraph L2["L2: 启动登记层"]
+        L2_1[spawn-interceptor]
+        L2_2[记录 task-log.jsonl]
+        L2_3[pendingTasks Map]
+    end
+
+    subgraph L3["L3: 基础终态层"]
+        L3_1[ACP Session Poller]
+        L3_2[Stale Reaper]
+    end
+
+    subgraph L4["L4: 终态纠偏层"]
+        L4_1[content-aware-completer]
+        L4_2[内容证据分析]
+        L4_3[四层决策]
     end
 
     subgraph State["共享状态面 shared-context/*"]
@@ -149,37 +275,45 @@ flowchart TB
         S2[dispatches/]
         S3[intel/]
         S4[followups/]
-        S5[monitor-tasks/task-log.jsonl]
+        S5[task-log.jsonl]
+        S6[agent-outputs/]
     end
 
     U --> M1
     M1 --> M2
     M2 --> M3
     M3 -->|短任务| M4
-    M3 -->|长任务| P1
-    
+    M3 -->|长任务| L2_1
+
     M4 --> C1
     C1 --> A1 & A2 & A3
     A1 & A2 & A3 --> C2
     C2 --> M4
     A1 & A2 & A3 --> C3
-    
-    P1 --> P2
-    P2 --> S5
-    P1 --> P3
-    P3 -->|ACP 执行| A1
-    A1 -->|sessions_send 完成| L1
-    L1 --> L2
-    L2 --> L3
-    L3 --> S5
-    
+
+    L2_1 --> L2_2
+    L2_2 --> S5
+    L2_1 --> L2_3
+
+    A1 -->|stream events| L1_1
+    L1_1 --> L1_2
+    L1_2 --> M4
+
+    L3_1 -->|检测 session| L3
+    L3_2 -->|timeout| L3
+    L3 -->|基础终态| S5
+
+    L4_1 -->|读取| S6
+    L4_2 -->|分析| L4_3
+    L4_3 -->|终态确认| S5
+
     C3 --> S1 & S2 & S3
     M4 --> S4
 ```
 
 ---
 
-## 通信层架构：拦截 + 回调
+## 通信层架构：四层完成链路
 
 > 详见 [COMMUNICATION_ISSUES.md](COMMUNICATION_ISSUES.md) 完整设计文档
 
@@ -187,42 +321,43 @@ flowchart TB
 
 | 问题 | 根因 | 解决方案 |
 |------|------|----------|
-| ACP 完成不通知 | OpenClaw Bug #40272 | prompt 注入完成回调 |
+| ACP 完成不通知 | OpenClaw Bug #40272 | 四层完成检测链路 |
 | timeout 语义模糊 | `sessions_send` 只有 ok/timeout | task-log 确定性追踪 |
 | Agent 忘记注册监控 | LLM 肌肉记忆 | `before_tool_call` hook 自动拦截 |
+| Type 4 任务假完成 | 仅依赖会话状态 | L4 内容证据验证 |
 
 ### 架构决策
+
+**为什么用四层架构**：
+- **分层防御**：每层处理不同场景，优雅降级
+- **职责分离**：L2 登记、L3 检测、L4 验证
+- **避免单点故障**：多层保障确保任务不丢失
+
+**为什么需要 L4 内容验证**：
+- 会话关闭 ≠ 任务真正完成
+- 需要内容证据防止假完成
+- 解决历史文件、空文件问题
 
 **为什么不用文件轮询**：
 - 行业共识：轮询用于编排是反模式
 - 延迟高（最坏 5 分钟）
-- 代码量大（旧方案 ~2,543 行 (v1.1.0, 含 DLQ/Terminal Bridge/Guardrail) vs 新方案 ~600 行）
-
-**为什么不用 Lobster（OpenClaw 内建 YAML 工作流引擎）**：
-- Lobster 适合确定性同步流程
-- 我们需要异步完成通知 + 灵活的 LLM 编排
-- 可共存：确定性流程用 Lobster，异步任务用 plugin
-
-**为什么不用主流编排框架（LangGraph/CrewAI/AutoGen）**：
-- OpenClaw 是 Agent Runtime（非 Python 编排框架）
-- 引入外部框架会破坏 OpenClaw 的 session 管理
-- plugin 机制是 OpenClaw 原生的扩展方式
+- 代码量大（旧方案 ~2,543 行 vs 新方案 ~800 行）
 
 ### 实现位置
 
-| 组件 | 路径 | 语言 | 行数 |
-|------|------|------|------|
-| spawn-interceptor | `plugins/spawn-interceptor/` | Node.js | ~150 |
-| completion-listener | `examples/completion-relay/` | Python | ~200 |
-| 设计文档 | `COMMUNICATION_ISSUES.md` | — | — |
+| 组件 | 路径 | 语言 | 行数 | 层级 |
+|------|------|------|------|------|
+| spawn-interceptor | `plugins/spawn-interceptor/` | Node.js | ~150 | L2 |
+| completion-listener | `examples/completion-relay/` | Python | ~200 | 通知 |
+| content-aware-completer | `examples/content-aware-completer/` | Python | ~400 | L4 |
 
 ### 代码量对比
 
-| 维度 | 旧方案 (task-callback-bus) | 新方案 |
-|------|---------------------------|--------|
-| 核心代码 | ~2,543 行 (v1.1.0, 含 DLQ/Terminal Bridge/Guardrail) Python | ~600 行 (JS + Python) |
-| 轮询频率 | 每 5 分钟 | 无轮询（事件驱动） |
-| 注册方式 | Agent 手动 / wrapper | 自动（plugin hook） |
+| 维度 | 旧方案 (task-callback-bus) | 新方案 (v2.5) |
+|------|---------------------------|--------------|
+| 核心代码 | ~2,543 行 Python | ~750 行 (JS + Python) |
+| 架构 | 单层重组件 | 四层轻量链路 |
+| 完成验证 | 仅会话状态 | 会话 + 内容证据 |
 | 通知延迟 | 最坏 5 分钟 | < 1 分钟 |
 
 ---
@@ -233,24 +368,30 @@ flowchart TB
 
 ```mermaid
 stateDiagram-v2
-    [*] --> spawning: plugin 记录
-    spawning --> in_progress: ACP 开始执行
-    in_progress --> completed: sessions_send 完成通知
-    in_progress --> failed: sessions_send 失败通知
+    [*] --> spawning: L2 plugin 记录
+    spawning --> in_progress: L1 事件流 / ACP 开始
+    in_progress --> completed: L3 检测 + L4 验证
+    in_progress --> failed: 错误/超时
     completed --> [*]
     failed --> [*]
 ```
 
-### 控制面消息状态
+### 四层检测状态
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Request: 发送
-    Request --> ACKed: 接收 ACK
-    ACKed --> Final: 接收结论
-    Final --> Closed: NO_REPLY
-    ACKed --> Timeout: 超时
-    Timeout --> Request: 催办
+    [*] --> Pending: sessions_spawn
+    Pending --> L1_Receiving: streamTo="parent"
+    L1_Receiving --> L1_Progress: progress 事件
+    L1_Receiving --> L1_Stalled: stall 事件
+    L1_Stalled --> L1_Resumed: resumed 事件
+    L1_Progress --> L2_Registered: hook 拦截
+    L2_Registered --> L3_Detected: Poller 发现 closed
+    L3_Detected --> L4_Validating: 内容验证
+    L4_Validating --> Completed: Tier 1 强证据
+    L4_Validating --> L4_Rejected: 证据不足
+    L4_Rejected --> Pending: 继续等待
+    L3_Detected --> Timeout: Stale Reaper
 ```
 
 ---
@@ -284,14 +425,15 @@ stateDiagram-v2
 - 验收时优先检查文件产物
 - 聊天回执仅作为辅助参考
 
-### 4. 自动拦截模式（v2 新增）
+### 4. 四层检测模式
 
-**问题**：Agent 总是忘记手动注册监控。
+**问题**：单层检测存在盲区，导致任务丢失或假完成。
 
 **方案**：
-- 用 `before_tool_call` hook 自动拦截 `sessions_spawn`
-- Agent 继续使用原生工具，无需记住额外步骤
-- 系统层保障 > 文档约束
+- L1 原生事件流：实时状态
+- L2 Hook 拦截：强制登记
+- L3 轮询+收割：基础终态
+- L4 内容验证：纠偏确认
 
 ### 5. 反思落地闭环模式
 
@@ -318,6 +460,7 @@ stateDiagram-v2
 1. 定义任务触发条件
 2. 确定执行阈值（同步/异步）
 3. plugin 自动追踪（无需额外配置）
+4. 如有需要，配置 L4 验证规则
 
 ### 集成外部系统
 
@@ -344,6 +487,7 @@ stateDiagram-v2
 - 所有 ACP 任务自动记录到 task-log.jsonl
 - 控制面消息有 ack_id 追踪
 - 完成通知有时间戳和状态
+- L4 记录内容证据和置信度
 
 ---
 
@@ -362,14 +506,14 @@ stateDiagram-v2
 ### 响应优化
 - ACK 优先，结果后补
 - 事件驱动通知（< 1 分钟延迟）
-- 超时自动降级
+- L4 增量验证，避免全量扫描
 
 ---
 
 ## 故障恢复
 
 ### 任务失败
-1. completion-listener 记录失败到 task-log
+1. L3/L4 记录失败到 task-log
 2. 通知相关方
 3. 决定重试/降级/放弃
 
@@ -382,6 +526,11 @@ stateDiagram-v2
 1. Gateway 日志检查 `spawn-interceptor` 错误
 2. 降级：手动追踪任务
 3. 修复后 `launchctl kickstart` 重启 Gateway
+
+### L4 Completer 异常
+1. 检查 `agent-outputs/` 目录权限
+2. 检查 task-log 格式
+3. 使用 `--dry-run` 模式调试
 
 ---
 
@@ -396,23 +545,40 @@ stateDiagram-v2
 
 ## 统一监控: task-log.jsonl
 
-v2.3+ 引入了统一的 `task-log.jsonl` 作为所有任务事件的单一事实源。
+v2.5 引入了四层架构，`task-log.jsonl` 依然作为所有任务事件的单一事实源。
 
 ### 写入方
 
-| 来源 | runtime 值 | completionSource |
-|------|-----------|------------------|
-| spawn-interceptor (L1: subagent_ended) | `subagent` | `subagent_ended_hook` |
-| spawn-interceptor (L2: ACP session poller) | `acp` | `acp_session_poller` |
-| spawn-interceptor (L3: stale reaper) | 任意 | `stale_reaper` |
-| task-callback-bus WatcherBus (状态变化) | `external` | `watcher_state_change` |
-| task-callback-bus WatcherBus (任务关闭) | `external` | `watcher_close` |
+| 来源 | runtime 值 | completionSource | 层级 |
+|------|-----------|------------------|------|
+| spawn-interceptor (L2 登记) | `acp`/`subagent` | `spawn_interceptor` | L2 |
+| ACP Session Poller (L3) | `acp` | `acp_session_poller` | L3 |
+| Stale Reaper (L3) | 任意 | `stale_reaper` | L3 |
+| content-aware-completer (L4) | 任意 | `content_aware_completer` | L4 |
+
+### L4 写入格式
+
+```json
+{
+  "taskId": "tsk_20260313_abc123",
+  "status": "completed",
+  "completionSource": "content_aware_completer",
+  "completionReason": "Tier 1: Session closed + content evidence present",
+  "confidence": "high",
+  "evidence": {
+    "hasStreamClosed": true,
+    "hasContentOutput": true,
+    "contentSize": 1024,
+    "completionKeywordsFound": ["completed", "finished"],
+    "outputFiles": ["agent-outputs/tsk_abc123/output.md"]
+  },
+  "completedAt": "2026-03-13T01:32:15.000Z",
+  "updatedAt": "2026-03-13T01:32:15.000Z"
+}
+```
 
 ### 读取方
 
-- `completion-listener`：增量读取 `task-log.jsonl`，通过 `.relay-cursor-v2` 记录进度
+- `completion-listener`：增量读取 `task-log.jsonl`
+- `content-aware-completer`：读取 pending 任务，写入 completion
 - 任意外部脚本：按 JSONL 格式逐行解析
-
-### 格式
-
-每行一个 JSON 对象，必含字段：`taskId`, `status`, `completionSource`。其余字段按来源补充。

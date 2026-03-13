@@ -4,7 +4,7 @@
 
 [中文版 (Chinese README)](README_CN.md)
 
-**Version**: 2026-03-13-v8 | **License**: MIT | **Status**: Production Ready
+**Version**: 2026-03-13-v9 | **License**: MIT | **Status**: Production Ready
 
 ---
 
@@ -44,20 +44,73 @@ After a day of multi-agent orchestration, you ask: "What tasks were spawned toda
 
 ---
 
-## The Solution
+## The Solution: Four-Layer Completion Pipeline
 
 **Core insight**: If a behavior is mandatory, it should be a system constraint — not a documentation constraint.
 
 Instead of teaching agents to remember extra steps (which always fails), we intercept at the system level using OpenClaw's plugin hooks (which always works).
 
+### Four-Layer Completion Detection
+
+Our completion detection uses a **four-layer defensive architecture** that handles different task types and edge cases:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETION DETECTION PIPELINE v2.5                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  LAYER 1: Native Event Stream (OpenClaw)                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  sessions_spawn(runtime="acp", streamTo="parent")                  │   │
+│  │  • Receives progress, stall, resumed events                        │   │
+│  │  • Real-time status updates via stream                             │   │
+│  │  • Covers: runtime=acp with streamTo                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  LAYER 2: Registration Layer (spawn-interceptor)                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  before_tool_call hook intercepts sessions_spawn                    │   │
+│  │  • Records task to task-log.jsonl (spawning)                       │   │
+│  │  • Stores in pendingTasks Map                                       │   │
+│  │  • NOT completion truth — only start registration                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  LAYER 3: Basic Completion (Poller + Reaper)                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  L3a: ACP Session Poller (~15s)                                     │   │
+│  │       Polls ~/.acpx/sessions/ for closed sessions                  │   │
+│  │                                                                     │   │
+│  │  L3b: Stale Reaper (30min safety net)                               │   │
+│  │       Marks long-pending tasks as timeout                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  LAYER 4: Terminal-State Correction (content-aware-completer)              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Solves "Registered=False, Terminal=False" (Type 4 tasks)          │   │
+│  │  • Tier 1: Requires BOTH session closed + content evidence         │   │
+│  │  • Rejects historical files, empty files                           │   │
+│  │  • Idempotent writes, UTC timezone safe                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│                    Unified: task-log.jsonl                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Clarifications
+
+| Misconception | Reality |
+|--------------|---------|
+| "Hook is completion truth" | Hook only registers task START. Completion needs Layer 3/4. |
+| "Intermediate states from hook" | Intermediate states come from Layer 1 native event stream, not hook. |
+| "Plugin auto-closes loop" | Plugin enables tracking. Content-aware completer validates completion. |
+
 ### spawn-interceptor Plugin (v2.4)
 
-A single OpenClaw plugin (~250 lines of JavaScript) that:
+An OpenClaw plugin (~250 lines of JavaScript) that:
 
 1. **Automatically intercepts** every `sessions_spawn` call via the `before_tool_call` hook
 2. **Logs the task** to `task-log.jsonl` with status `spawning`
-3. **Detects completion** through a 3-layer defense system
-4. **Updates the log** when the task completes, fails, or times out
+3. **Provides foundation** for completion detection (Layer 2)
 
 Zero configuration. Zero agent-side changes. Agents don't even know it exists.
 
@@ -79,26 +132,21 @@ Agent calls sessions_spawn()
 │  │  • Store in pendingTasks Map             │   │
 │  └──────────────────────────────────────────┘   │
 │                                                 │
-│  ┌─ Completion Detection (3 layers) ────────┐   │
+│  ┌─ Completion Detection (4 layers) ────────┐   │
 │  │                                          │   │
-│  │  L1: subagent_ended hook         (<1s)   │   │
-│  │      OpenClaw fires this event when a    │   │
-│  │      subagent finishes. BUT: it does     │   │
-│  │      NOT fire for ACP runtime sessions.  │   │
-│  │      Covers: runtime=subagent only.      │   │
+│  │  L1: Native Event Stream                 │   │
+│  │      streamTo="parent" progress events   │   │
 │  │                                          │   │
-│  │  L2: ACP Session Poller          (~15s)  │   │
-│  │      Polls ~/.acpx/sessions/index.json   │   │
-│  │      every 15 seconds. When a session    │   │
-│  │      has closed:true, matches it to a    │   │
-│  │      pending task by creation timestamp  │   │
-│  │      (±60s window).                      │   │
-│  │      Covers: runtime=acp.               │   │
+│  │  L2: Registration Layer         (hook)   │   │
+│  │      Records spawning state              │   │
 │  │                                          │   │
-│  │  L3: Stale Reaper                (30min) │   │
-│  │      Safety net. Any task pending for    │   │
-│  │      >30 minutes is marked as timeout.   │   │
-│  │      Covers: all runtimes.              │   │
+│  │  L3: Basic Completion                    │   │
+│  │      • ACP Session Poller (~15s)         │   │
+│  │      • Stale Reaper (30min)              │   │
+│  │                                          │   │
+│  │  L4: Terminal-State Correction           │   │
+│  │      content-aware-completer.py          │   │
+│  │      Requires content evidence           │   │
 │  │                                          │   │
 │  └──────────────────────────────────────────┘   │
 │                                                 │
@@ -112,54 +160,32 @@ Agent calls sessions_spawn()
 │    (Single source of truth for ALL events)      │
 ├─────────────────────────────────────────────────┤
 │ Writers:                                        │
-│   • spawn-interceptor (internal ACP/subagent)   │
-│   • task-callback-bus WatcherBus (external)      │
+│   • spawn-interceptor (Layer 2)                 │
+│   • content-aware-completer (Layer 4)           │
+│   • completion-listener (notifications)         │
 │                                                 │
 │ Consumers:                                      │
-│   • completion-listener (alerts/notifications)  │
-│   • discord_task_panel.py (status dashboard)    │
 │   • Any JSONL reader                            │
 └─────────────────────────────────────────────────┘
 ```
 
-### External Task Monitoring
+### content-aware-completer (Layer 4)
 
-For tasks that run outside of OpenClaw (browser automation, social media monitoring, cron jobs), a separate Python component handles monitoring:
+Solves the **Type 4 task problem** (tasks that appear non-terminal but should be completed):
 
-```
-┌───────────────┐     ┌──────────────────────────────┐
-│ External      │     │  task-callback-bus v1.1.0     │
-│ Systems       │◄──► │  WatcherBus (2,543 lines)     │
-│ ─────────     │     │                              │
-│ • XHS posts   │     │  Adapters:                   │
-│ • GitHub PRs  │     │  • XiaohongshuNoteReview     │
-│ • Cron jobs   │     │  • GitHubPRStatus            │
-│ • ACP status  │     │  • CronJobCompletion         │
-│               │     │  • AcpSessionCompletion      │
-└───────────────┘     │  • CodingAgentRunStatus      │
-                      │                              │
-                      │  Notifiers:                  │
-                      │  • Discord, Telegram, Session │
-                      │                              │
-                      │  Guardrails (v1.1.0):        │
-                      │  • DLQ (Dead Letter Queue)   │
-                      │  • Terminal Bridge           │
-                      │  • Agent Comm Guardrail      │
-                      │    (dedup/identity/channel)  │
-                      └──────────────────────────────┘
-```
+| Tier | Evidence Required | Action | Confidence |
+|------|------------------|--------|------------|
+| Tier 1 | Session closed + Content evidence | Mark complete | High |
+| Tier 2 | Session closed, No content | Keep pending | Medium |
+| Tier 3 | Content present, Session open | Keep pending | Low |
+| Tier 4 | No evidence | Keep pending | Low |
 
-### Why 3 Layers?
-
-We discovered the hard way that **OpenClaw's `subagent_ended` hook does NOT fire for ACP runtime sessions**. This is an undocumented limitation. ACP sessions are managed by the `acpx` binary, and their lifecycle is tracked in `~/.acpx/sessions/` — completely separate from OpenClaw's hook system.
-
-Our completion detection went through 3 iterations before landing on the current design:
-
-| Attempt | Approach | Result |
-|---------|----------|--------|
-| v2.1 | Prompt injection (tell ACP agent to send completion message) | Failed. Oneshot ACP agents ignore injected instructions after completing their primary task. |
-| v2.2 | Rely on `subagent_ended` hook as primary | Failed. Hook doesn't fire for `runtime=acp`. All ACP tasks stuck at `spawning` forever. |
-| v2.3 | ACP Session Poller + `subagent_ended` + Stale Reaper | Works. Layered defense covers all runtimes with graceful degradation. |
+**Core Rules**:
+- **Strong Evidence Required**: Both session closed AND content evidence
+- **Historical File Rejection**: Prevents marking tasks complete based on old files
+- **Empty File Rejection**: Ignores zero-byte outputs
+- **Idempotent Writes**: Safe to run multiple times
+- **UTC Timezone Safe**: All timestamps in UTC
 
 ---
 
@@ -168,10 +194,10 @@ Our completion detection went through 3 iterations before landing on the current
 ### Prerequisites
 
 - OpenClaw >= 2026.3.x (requires `before_tool_call` plugin hook support)
-- Python 3.10+ (for completion-listener and task-callback-bus)
+- Python 3.10+ (for completion-listener and content-aware-completer)
 - At least 1 agent configured
 
-### 1. Install the plugin
+### 1. Install the Plugin
 
 ```bash
 cp -r plugins/spawn-interceptor ~/.openclaw/extensions/
@@ -206,26 +232,17 @@ You should see entries like:
 }
 ```
 
-And ~15 seconds after the ACP task completes:
-
-```json
-{
-  "taskId": "tsk_20260313_abc123",
-  "status": "completed",
-  "completionSource": "acp_session_poller",
-  "completedAt": "2026-03-13T01:32:15.000Z"
-}
-```
-
-### 4. (Optional) Set up completion-listener
+### 4. (Optional) Set up content-aware-completer
 
 ```bash
-# Add to crontab for periodic checks
-echo "*/1 * * * * cd /path/to/examples/completion-relay && python3 completion_listener.py --once >> /tmp/completion.log 2>&1" | crontab -
+# Run continuously for Tier 4 completion correction
+python3 examples/content-aware-completer/content_aware_completer.py --loop --interval 30
 
-# Or run continuously
-python3 examples/completion-relay/completion_listener.py --loop --interval 30
+# Or run once
+python3 examples/content-aware-completer/content_aware_completer.py --once
 ```
+
+**Recommended mode**: `mode="run"` for coding/documentation tasks. Use `mode="session"` or `mode="thread"` only for complex multi-turn tasks.
 
 See [QUICKSTART.md](QUICKSTART.md) for the full deployment guide.
 
@@ -239,8 +256,38 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 |-------|------------|--------|---------------|
 | [#34054](https://github.com/openclaw/openclaw/issues/34054) | Gateway doesn't call `runtime.close()` for completed oneshot sessions | Zombie sessions hit `maxConcurrentSessions` limit | Daily GC in Guardian script |
 | [#35886](https://github.com/openclaw/openclaw/issues/35886) | ACP child processes not cleaned after TTL | Zombie process accumulation | Guardian health-check auto-restart |
-| [#40272](https://github.com/openclaw/openclaw/issues/40272) | `notifyChannel` doesn't work in ACP | No native completion notification | spawn-interceptor plugin |
-| (undocumented) | `subagent_ended` hook doesn't fire for ACP runtime | ACP task status stuck at `spawning` | v2.4 ACP Session Poller |
+| [#40272](https://github.com/openclaw/openclaw/issues/40272) | `notifyChannel` doesn't work in ACP | No native completion notification | Four-layer completion pipeline |
+| (undocumented) | `subagent_ended` hook doesn't fire for ACP runtime | ACP task status stuck at `spawning` | ACP Session Poller (Layer 3) |
+
+---
+
+## Default Agent Template
+
+When spawning ACP agents, use this minimal template:
+
+```python
+# Default version (coding/docs tasks)
+sessions_spawn(
+    sessionKey=f"agent:{agent_id}:task",
+    agentId=agent_id,
+    prompt="Your task here",
+    mode="run",  # Recommended for most tasks
+    streamTo="parent",  # Enables Layer 1 event stream
+)
+```
+
+For complex multi-turn tasks:
+
+```python
+# Extended version (complex multi-turn tasks only)
+sessions_spawn(
+    sessionKey=f"agent:{agent_id}:task",
+    agentId=agent_id,
+    prompt="Your complex task here",
+    mode="session",  # Only for complex multi-turn
+    streamTo="parent",
+)
+```
 
 ---
 
@@ -252,9 +299,11 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Architecture deep-dive with data flow diagrams |
 | [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) | Full collaboration protocol specification |
 | [CAPABILITY_LAYERS.md](CAPABILITY_LAYERS.md) | L1 (OpenClaw native) / L2 (framework) / L3 (needs core changes) |
+| [CONTENT_AWARE_COMPLETER.md](CONTENT_AWARE_COMPLETER.md) | Layer 4 completion validation documentation |
 | [QUICKSTART.md](QUICKSTART.md) | Detailed deployment guide |
 | [GETTING_STARTED.md](GETTING_STARTED.md) | Onboarding for new users |
 | [ANTIPATTERNS.md](ANTIPATTERNS.md) | Pitfalls and lessons learned |
+| [INTERNAL_VS_OSS.md](INTERNAL_VS_OSS.md) | Open source vs internal version differences |
 | [RELEASE_NOTES.md](RELEASE_NOTES.md) | Version history |
 
 ---
@@ -264,18 +313,23 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 ```
 ├── plugins/
 │   └── spawn-interceptor/        # OpenClaw plugin (~250 lines)
-│       ├── index.js              # v2.4: hooks + ACP poller + stale reaper
+│       ├── index.js              # v2.4: hooks + completion pipeline
 │       ├── package.json          # Plugin metadata
 │       └── openclaw.plugin.json  # OpenClaw plugin manifest
 ├── examples/
-│   ├── completion-relay/         # Completion notification listener
+│   ├── completion-relay/         # Basic completion listener
 │   │   ├── completion_listener.py
+│   │   └── tests/
+│   ├── content-aware-completer/  # Layer 4 completion validation
+│   │   ├── content_aware_completer.py
 │   │   └── tests/
 │   ├── l2_capabilities.py        # L2 capability implementations
 │   └── protocol_messages.py      # Protocol message format demo
 ├── COMMUNICATION_ISSUES.md       # Core design document
 ├── ARCHITECTURE.md               # Architecture deep-dive
 ├── AGENT_PROTOCOL.md             # Collaboration protocol
+├── CONTENT_AWARE_COMPLETER.md    # Layer 4 documentation
+├── INTERNAL_VS_OSS.md            # Open source scope
 ├── RELEASE_NOTES.md              # Version history
 └── README_CN.md                  # Chinese README
 ```
@@ -286,11 +340,13 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 
 | Principle | Old Way | Our Way |
 |-----------|---------|---------|
-| Task registration | Agent must remember wrapper function | Plugin hook auto-intercepts |
-| Completion detection | Prompt injection (ignored by ACP agents) | File-based session polling |
+| Task registration | Agent must remember wrapper function | Plugin hook auto-intercepts (Layer 2) |
+| Completion detection | Single point of failure | Four-layer defensive pipeline |
+| Intermediate states | Not tracked | Native event stream (Layer 1) |
+| Terminal validation | Session closed = complete | Content evidence required (Layer 4) |
 | State management | In-memory only (lost on restart) | Persistent to JSONL + pending file |
 | Monitoring | Separate files per component | Unified task-log.jsonl |
-| Error handling | Silent failures | DLQ + Stale Reaper + health checks |
+| Error handling | Silent failures | DLQ + Stale Reaper + Content validation |
 
 ---
 
