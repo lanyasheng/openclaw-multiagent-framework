@@ -225,6 +225,22 @@ flowchart LR
 - `sessions_send` 要求会话已存在（由先前的 `sessions_spawn` 创建）
 - 两个函数都使用 `sessionKey` 来标识目标
 
+### 控制面 vs 消息面
+
+两个**完全独立**的平面，不能混淆：
+
+| 平面 | 工具 | 用途 | 寻址方式 |
+|------|------|------|----------|
+| **控制面** | `sessions_send` | Agent-to-Agent 控制消息 | `sessionKey`（精确） |
+| **消息面** | `message.send` / provider | 仅用于用户可见的通知 | channel/label |
+
+**关键区别**：`message delivered ≠ control request received`
+
+- **控制面**：使用 `sessions_send` + `sessionKey` 进行精确会话级寻址，有 ACK 机制
+- **消息面**：使用 `message.send` 或 provider channel，仅用于用户可见的消息投递
+
+**典型故障场景**：Discord `allowBots=mentions` 配置下，非 mention 消息可能被其他 Bot 忽略（消息到达频道但不处理）。
+
 ### 上下文共享模型
 
 **默认：会话是隔离的**

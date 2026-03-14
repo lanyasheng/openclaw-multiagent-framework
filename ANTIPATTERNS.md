@@ -1,6 +1,6 @@
 # 反模式速查（Anti-Patterns）
 
-> Version: 2026-03-12-v2
+> Version: 2026-03-14-v3
 > 目标：帮助 Agent 和用户避免已知的协作陷阱
 
 ---
@@ -21,6 +21,7 @@
 | 10 | 无验收标准 | P1 | handoff 模板 |
 | 11 | 文件轮询做异步编排 | P0 | plugin + 事件驱动 |
 | 12 | 文档约束代替系统约束 | P0 | plugin hook |
+| 13 | 用 message.send 做控制面通信 | P0 | sessions_send + sessionKey |
 
 ---
 
@@ -178,6 +179,40 @@ tail -20 ~/.openclaw/shared-context/monitor-tasks/task-log.jsonl | grep <task_id
 
 ---
 
+## 13. 用 message.send 做控制面通信
+
+**症状**：用 `message.send` 或 provider channel 发送控制消息给其他 Agent
+
+**问题**：
+```
+message delivered ≠ control request received
+```
+
+- 消息投递成功只表示消息到达频道
+- 接收方可能因 `requireMention=true` 等配置忽略该消息
+- 无 ACK 机制，无法确认控制请求被处理
+- 典型故障：Discord `allowBots=mentions` 配置下，非 mention 消息不被处理
+
+**修复**：
+```
+❌ 错误：用 message.send 发控制消息
+   message.send(channel="#trading", text="@trading 分析BTC")
+
+✅ 正确：用 sessions_send + sessionKey
+   sessions_send(
+       sessionKey="agent:trading:control",
+       message="[Request] ack_id=..."
+   )
+```
+
+**规则**：
+- **控制面**：`sessions_send` + `sessionKey` → Agent-to-Agent 控制
+- **消息面**：`message.send` / provider → 仅用户可见通知
+
+**参考**：[AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) - 控制面 vs 消息面章节
+
+---
+
 ## 自查清单
 
 ```
@@ -188,4 +223,5 @@ tail -20 ~/.openclaw/shared-context/monitor-tasks/task-log.jsonl | grep <task_id
 □ 关键结论都落 shared-context/？
 □ 每日反思都有 followups/ 文件？
 □ 没有 Agent 在用文件轮询追踪任务？
+□ 没有在用 message.send 做控制面通信？
 ```

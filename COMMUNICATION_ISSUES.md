@@ -1,6 +1,6 @@
 # 通信层设计与演化
 
-> Version: 2026-03-13-v9
+> Version: 2026-03-14-v10
 > Status: 已实施 (spawn-interceptor v2.4)
 > 目标: 解决 OpenClaw 多 Agent 通信的三大痛点，用最小改动量实现可靠的异步通信
 
@@ -221,6 +221,112 @@ New: sessions_spawn → [hook auto-intercept] → ACP → sessions/index.json po
 
 ---
 
+## Troubleshooting: 消息到达频道但没有 ACK
+
+### 症状
+
+```
+用户: 为什么消息发到频道了，但 Agent 没有回应？
+
+现象：
+- 消息在 Discord/Slack 频道可见
+- 但接收方 Agent 没有发送 ACK
+- 任务没有开始执行
+```
+
+### 根本原因
+
+**`message delivered ≠ control request received`**
+
+消息投递（消息面）和控制请求处理（控制面）是两个独立的概念。
+
+### 典型故障场景
+
+#### 场景 1: Discord allowBots=mentions
+
+```
+配置:
+- Provider: Discord
+- allowBots: mentions
+- Agent B: requireMention=true
+
+流程:
+Agent A ──message.send("分析BTC")──▶ #trading-channel
+                                          ↓
+                                    消息到达频道
+                                          ↓
+                                    Agent B 检查：有 mention 我吗？
+                                          ↓
+                                    没有 → 忽略消息
+                                          ↓
+                                    ❌ 控制请求未被处理
+```
+
+**关键洞察**：
+- 消息到达频道 ≠ 消息被 Agent 处理
+- `allowBots=mentions` 时，非 mention 消息可能被其他 Bot 忽略
+
+#### 场景 2: 用 message.send 代替 sessions_send
+
+```
+❌ 错误用法：
+   message.send(channel="#control", text="[Request] ack_id=123...")
+
+   问题：
+   - 消息到达频道
+   - 但接收方 Agent 可能没配置处理此类消息
+   - 无 ACK 机制，无法确认处理
+
+✅ 正确用法：
+   sessions_send(
+       sessionKey="agent:trading:control",
+       message="[Request] ack_id=123..."
+   )
+
+   优势：
+   - sessionKey 精确寻址
+   - 有 ACK 机制
+   - 可追踪状态
+```
+
+### 诊断流程
+
+```
+消息发出后无 ACK？
+    │
+    ▼
+检查消息投递方式
+    │
+    ├── 用了 message.send / provider channel？
+    │       ↓
+    │   改用 sessions_send + sessionKey
+    │
+    └── 用了 sessions_send？
+            ↓
+        检查 sessionKey 是否正确
+            ↓
+        检查接收方 Agent 状态
+            ↓
+        查 task-log 确认真实状态
+```
+
+### 解决方案
+
+| 问题 | 解决方式 |
+|------|----------|
+| 用 message.send 发控制消息 | 改用 `sessions_send` + `sessionKey` |
+| Discord 消息被忽略 | 确保 `requireMention` 配置与实际使用一致 |
+| 不知道消息是否被处理 | 使用 ACK-First 协议（AGENT_PROTOCOL.md） |
+| 无法追踪任务状态 | 查 `task-log.jsonl` 确认真实状态 |
+
+### 相关文档
+
+- [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md) — 控制面 vs 消息面章节
+- [ANTIPATTERNS.md](ANTIPATTERNS.md) — 反模式 #13
+- [ROUNDTABLE_PROTOCOL.md](ROUNDTABLE_PROTOCOL.md) — 共享频道讨论规则
+
+---
+
 ## Version History
 
 | Version | Date | Changes |
@@ -232,7 +338,8 @@ New: sessions_spawn → [hook auto-intercept] → ACP → sessions/index.json po
 | v2.3 | 2026-03-13 | ACP session poller (~15s) |
 | v2.4 | 2026-03-13 | spawn-interceptor + four-layer pipeline |
 | v2.5 | 2026-03-13 | + content-aware-completer (L4) |
+| v2.6 | 2026-03-14 | + Troubleshooting: message delivered but no ACK |
 
 ---
 
-*Last updated: 2026-03-13 | See [Completion Truth Matrix](COMPLETION_TRUTH_MATRIX.md) for runtime completion sources*
+*Last updated: 2026-03-14 | See [Completion Truth Matrix](COMPLETION_TRUTH_MATRIX.md) for runtime completion sources*

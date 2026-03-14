@@ -225,6 +225,22 @@ flowchart LR
 - `sessions_send` requires the session to already exist (created by prior `sessions_spawn`)
 - Both functions use `sessionKey` to identify the target
 
+### Control Plane vs Messaging Plane
+
+Two distinct planes that must not be confused:
+
+| Plane | Tool | Purpose | Addressing |
+|-------|------|---------|------------|
+| **Control Plane** | `sessions_send` | Agent-to-agent control messages | `sessionKey` (exact) |
+| **Messaging Plane** | `message.send` / provider | User-visible notifications only | channel/label |
+
+**Critical distinction**: `message delivered ≠ control request received`
+
+- **Message delivered** (messaging plane): Message reached the channel
+- **Control request received** (control plane): Target agent processed the request and sent ACK
+
+For internal agent-to-agent control, always use `sessions_send` with `sessionKey`. Never use `message.send` or provider channels for control messages.
+
 ### Context Sharing Model
 
 **Default: Sessions are Isolated**
