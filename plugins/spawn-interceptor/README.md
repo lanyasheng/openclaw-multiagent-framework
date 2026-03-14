@@ -89,6 +89,8 @@ User gets notified
 - ACP completion relay depends on the ACP agent following the injected instructions
 - Does not replace dead-letter-queue or deduplication logic
 
+> **Note (2026-03-14)**: With [PR #46308](https://github.com/openclaw/openclaw/pull/46308), ACP sessions are now registered in the subagent registry, so `subagent_ended` hooks fire for them. This makes the ACP Session Poller a fallback rather than the primary detection path for ACP completion.
+
 ## Related
 
 - [COMMUNICATION_ISSUES.md](../../COMMUNICATION_ISSUES.md) — Full problem analysis

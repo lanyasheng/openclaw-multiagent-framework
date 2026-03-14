@@ -1,5 +1,7 @@
 # ACP Closure Report — 2026-03-13
 
+> **2026-03-14 Update**: The root cause of ACP lifecycle invisibility has been identified and fixed upstream. See the "Upstream Fix" section below.
+
 ## Summary
 
 As of 2026-03-13 evening, the main ACP completion-truth problem is considered **contained**:
@@ -61,6 +63,20 @@ This avoids the thread/session-close ambiguity that contributed to false non-ter
 - `shared-context/monitor-tasks/task-log.jsonl` already includes real reconciliation writes with:
   - `status = completed`
   - `completionSource = content_reconciler`
+
+---
+
+## Upstream Fix (2026-03-14)
+
+The root cause of the ACP lifecycle invisibility problem has been identified and fixed:
+
+**Root cause**: `acp-spawn.ts` did not call `registerSubagentRun()` after dispatching an ACP session. This meant ACP sessions were invisible to OpenClaw's subagent registry, so `subagent_ended` hooks never fired for them.
+
+**Fix**: [PR #46308](https://github.com/openclaw/openclaw/pull/46308) adds a `registerSubagentRun()` call in `spawnAcpDirect()` after successful dispatch, wrapped in a `try/catch` to avoid breaking the spawn flow if registration fails.
+
+**Impact**: With this fix deployed, `subagent_ended` hooks now fire for ACP sessions, making the ACP Session Poller (Layer 3) a fallback rather than the sole detection mechanism.
+
+**Related**: [PR #44970](https://github.com/openclaw/openclaw/pull/44970) fixes a separate bug where embedded LLM runs didn't throw `FailoverError`, breaking the model fallback chain.
 
 ---
 

@@ -266,4 +266,6 @@ grep "stale_reaper" ~/.openclaw/shared-context/monitor-tasks/task-log.jsonl | ta
 
 ---
 
-*Last updated: 2026-03-13 | See [ARCHITECTURE.md](ARCHITECTURE.md) for full four-layer architecture*
+*Last updated: 2026-03-14 | See [ARCHITECTURE.md](ARCHITECTURE.md) for full four-layer architecture*
+
+> **2026-03-14 Update**: [PR #46308](https://github.com/openclaw/openclaw/pull/46308) fixes ACP lifecycle registration so `subagent_ended` hooks now fire for ACP sessions. With this fix, `acp_session_poller` becomes a fallback rather than the primary completion source for ACP tasks.

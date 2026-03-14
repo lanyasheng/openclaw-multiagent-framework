@@ -61,6 +61,8 @@ LLMs have muscle memory — they default to native tool calls and skip wrapper f
 
 Completed ACP sessions don't get properly cleaned up by the OpenClaw Gateway (Bug [#34054](https://github.com/openclaw/openclaw/issues/34054)). These zombie sessions accumulate silently until they hit the `maxConcurrentSessions` limit (default: 6), at which point all new ACP tasks fail with a cryptic "max sessions exceeded" error — even though the agent swears everything is closed.
 
+> **Update (2026-03-14)**: The root cause — `acp-spawn.ts` not calling `registerSubagentRun()` — has been identified and fixed in [PR #46308](https://github.com/openclaw/openclaw/pull/46308). With this fix, `subagent_ended` hooks now fire for ACP sessions, enabling proper lifecycle tracking. The ACP Session Poller (Layer 3) remains useful as a fallback for older Gateway versions.
+
 ### 4. Timeout Ambiguity
 
 `sessions_send` returns "timeout". But what does that mean?
@@ -412,9 +414,9 @@ This framework will remain **honest about its scope**:
 
 ---
 
-### spawn-interceptor Plugin (v2.4)
+### spawn-interceptor Plugin (v2.5)
 
-An OpenClaw plugin (~250 lines of JavaScript) that:
+An OpenClaw plugin (~300 lines of JavaScript) that:
 
 1. **Automatically intercepts** every `sessions_spawn` call via the `before_tool_call` hook
 2. **Logs the task** to `task-log.jsonl` with status `spawning`
@@ -429,8 +431,8 @@ Agent calls sessions_spawn()
          │
          ▼
 ┌─────────────────────────────────────────────────┐
-│             spawn-interceptor v2.4              │
-│          (OpenClaw Plugin, ~250 lines)          │
+│             spawn-interceptor v2.5              │
+│          (OpenClaw Plugin, ~300 lines)          │
 ├─────────────────────────────────────────────────┤
 │                                                 │
 │  ┌─ before_tool_call hook ──────────────────┐   │
@@ -565,7 +567,7 @@ This framework exists partly because of these unresolved bugs in OpenClaw:
 | [#34054](https://github.com/openclaw/openclaw/issues/34054) | Gateway doesn't call `runtime.close()` for completed oneshot sessions | Zombie sessions hit `maxConcurrentSessions` limit | Daily GC in Guardian script |
 | [#35886](https://github.com/openclaw/openclaw/issues/35886) | ACP child processes not cleaned after TTL | Zombie process accumulation | Guardian health-check auto-restart |
 | [#40272](https://github.com/openclaw/openclaw/issues/40272) | `notifyChannel` doesn't work in ACP | No native completion notification | Four-layer completion pipeline |
-| (undocumented) | `subagent_ended` hook doesn't fire for ACP runtime | ACP task status stuck at `spawning` | ACP Session Poller (Layer 3) |
+| (undocumented) | `subagent_ended` hook didn't fire for ACP runtime | ACP task status stuck at `spawning` | ACP Session Poller (Layer 3); **fixed upstream in [PR #46308](https://github.com/openclaw/openclaw/pull/46308)** |
 
 ---
 
@@ -624,7 +626,7 @@ sessions_spawn(
 ```
 ├── plugins/
 │   └── spawn-interceptor/        # OpenClaw plugin (~250 lines)
-│       ├── index.js              # v2.4: hooks + completion pipeline
+│       ├── index.js              # v2.5: hooks + completion pipeline
 │       ├── package.json          # Plugin metadata
 │       └── openclaw.plugin.json  # OpenClaw plugin manifest
 ├── examples/

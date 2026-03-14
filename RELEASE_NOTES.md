@@ -1,6 +1,20 @@
 # Release Notes
 
 ---
+## v2.5.2 — spawn-interceptor 可靠性强化 + 上游 ACP 修复 (2026-03-14)
+
+### 上游修复
+
+- **ACP subagent_ended 修复** ([PR #46308](https://github.com/openclaw/openclaw/pull/46308))：`acp-spawn.ts` 现在调用 `registerSubagentRun()`，使 `subagent_ended` hook 也能被 ACP 会话触发。此前该 hook 仅对 `runtime=subagent` 生效。
+- **LLM Fallback 降级修复** ([PR #44970](https://github.com/openclaw/openclaw/pull/44970))：修复 embedded run 不抛 `FailoverError` 导致 fallback 链断裂的问题。
+
+### spawn-interceptor 改进 (v2.5.0 → v2.5.2)
+
+- **v2.5.0**: `subagent_ended` 按 `targetSessionKey` 精确匹配（替代按类型首个匹配）；ACP poller 防重匹配已关闭会话；fallback 状态从 `completed` 改为 `assumed_complete`；新增 `unregister()` 清理定时器；版本号在 `package.json` 和 `index.js` 间同步
+- **v2.5.1**: `consumedAcpSessionIds` 提升为模块级变量，跨 poll 迭代持久化
+- **v2.5.2**: ACP matcher 要求 `sessionCreatedAt >= spawnTs - 2s`，防止旧会话误匹配新任务
+
+---
 ## v2.4.0 — 通信护栏 + 死信队列 + 任务链自动化 (2026-03-13)
 
 > **Note**: This release and subsequent versions use the `spawn-interceptor` plugin architecture. The older `task-callback-bus` (~2,543 lines, file-polling based) is deprecated and not included in the open source package. See [INTERNAL_VS_OSS.md](INTERNAL_VS_OSS.md) for details.
@@ -46,7 +60,7 @@ task-callback-bus v1.1.0 (2,543 行, +247 行)
 
 ### 核心发现
 
-**`subagent_ended` hook 不对 ACP runtime 生效**。之前 v2.2 假设 `subagent_ended` 是 PRIMARY 完成检测机制，但实际测试表明 OpenClaw 的该 hook 仅对 `runtime=subagent` 触发，ACP session 结束时不会触发。这导致所有 ACP 任务永远卡在 `spawning` 状态。
+**`subagent_ended` hook 不对 ACP runtime 生效**（在当时版本）。之前 v2.2 假设 `subagent_ended` 是 PRIMARY 完成检测机制，但实际测试表明 OpenClaw 的该 hook 仅对 `runtime=subagent` 触发，ACP session 结束时不会触发。这导致所有 ACP 任务永远卡在 `spawning` 状态。**注：此问题已在 [PR #46308](https://github.com/openclaw/openclaw/pull/46308) 中修复**。
 
 ### 新增: ACP Session Poller
 

@@ -352,7 +352,7 @@ flowchart TB
 
 | 组件 | 路径 | 语言 | 行数 | 层级 |
 |------|------|------|------|------|
-| spawn-interceptor | `plugins/spawn-interceptor/` | Node.js | ~150 | L2 |
+| spawn-interceptor | `plugins/spawn-interceptor/` | Node.js | ~300 | L2 |
 | completion-listener | `examples/completion-relay/` | Python | ~200 | 通知 |
 | content-aware-completer | `examples/content-aware-completer/` | Python | ~400 | L4 |
 
