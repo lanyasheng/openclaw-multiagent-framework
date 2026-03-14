@@ -6,7 +6,8 @@
  *   2. ACP session poller — reads ~/.acpx/sessions/index.json for closed sessions
  *   3. Stale reaper — marks tasks stuck > 30min as timeout (final safety net)
  *
- * Key insight: OpenClaw's subagent_ended hook does NOT fire for ACP runtime sessions.
+ * Key insight: OpenClaw's subagent_ended hook historically did NOT fire for ACP runtime
+ * sessions (fixed upstream in PR #46308 by adding registerSubagentRun to acp-spawn.ts).
  * ACP sessions are managed by acpx, and their lifecycle is recorded in ~/.acpx/sessions/.
  * The poller reads the index.json to find closed sessions, then matches them to pending
  * tasks by creation time proximity.

@@ -213,11 +213,13 @@ New: sessions_spawn → [hook auto-intercept] → ACP → sessions/index.json po
 
 ### Deprecated: subagent_ended Hook v2.1
 
-**Status**: Deprecated due to OpenClaw bug
+**Status**: Deprecated due to OpenClaw bug (now fixed upstream)
 
 **Why deprecated**:
-- `subagent_ended` hook does not fire for ACP runtime (OpenClaw issue)
+- `subagent_ended` hook did not fire for ACP runtime because `acp-spawn.ts` didn't call `registerSubagentRun()`
 - Replaced by explicit session polling (v2.3+)
+
+> **2026-03-14 Update**: This bug has been fixed upstream in [PR #46308](https://github.com/openclaw/openclaw/pull/46308). With the fix, `subagent_ended` now fires for ACP sessions. The ACP Session Poller remains as a fallback.
 
 ---
 
