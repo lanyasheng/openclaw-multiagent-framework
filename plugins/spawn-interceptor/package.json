@@ -1,8 +1,8 @@
 {
   "name": "spawn-interceptor",
-  "version": "2.5.2",
+  "version": "3.3.0",
   "type": "module",
-  "description": "Auto-tracks sessions_spawn and detects ACP completion via session polling",
+  "description": "Task tracking, streamTo parent injection, transcript fallback, and full completion reports via Discord",
   "main": "index.js",
   "keywords": [
     "openclaw",

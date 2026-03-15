@@ -1,9 +1,10 @@
 # AGENT_PROTOCOL.md — 团队统一协作协议
 
-> Version: 2026-03-13-v4 (ACK-First 强制版 + Plugin 自动拦截)
+> Version: 2026-03-14-v4.1 (Error Governance + Timeout Semantics)
 > Owner: main (Zoe)
 > Scope: All agents
 > Status: Canonical
+> Changes: 新增 §16 Error Governance & Timeout Semantics（事故驱动）
 
 > **See also**: [Communication Model](README.md#communication-model--session-boundaries) for Agent/Session/Thread distinctions and [Positioning](README.md#positioning-why-this-approach-now) for design philosophy.
 
@@ -573,3 +574,112 @@ T+终态: 发送 Final (仅一次)
 【需要决策】<如需 main 决定>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+---
+
+## 16. Error Governance & Timeout Semantics
+
+> **Incident-Driven**: 2026-03-14 P0 dispatch timeout incident
+> **Core Principle**: Timeout ≠ Failure
+
+### 16.1 Key Distinction: Timeout ≠ Failure
+
+```markdown
+❌ Wrong: `sessions_send` returns timeout = send failed = retry immediately
+✅ Correct: timeout means "no ACK within wait window", NOT control plane failure
+```
+
+**Real Incident (2026-03-14)**:
+- 4 P0 dispatches resent using sessionKey
+- Tool returned timeout
+- **Actual state**: messages sent, ACK window timed out, but messages were in target agent queue
+
+**Rule**: After timeout, check status file first; never retry directly.
+
+### 16.2 Timeout Taxonomy (Four Types)
+
+| Type | Definition | Detection | Action |
+|------|------------|-----------|--------|
+| **T1 Transport** | Transport layer failure | No status file, gateway log shows failure | Retry once with same ack_id |
+| **T2 ACK** | Delivered but no ACK | Status file exists (acknowledged/started) | Wait, do NOT retry |
+| **T3 Execution** | ACK'd but execution timeout | Status state=in_progress | Long-task protocol |
+| **T4 Completion** | Done but notification lost | Artifacts exist, status not terminal | content-aware-completer correction |
+
+### 16.3 Resend Policy
+
+**Allowed to resend (ALL must be true)**:
+1. Status file absent or state=failed
+2. Confirmed T1 Transport Timeout
+3. Same ack_id used
+4. Idempotency check enabled
+
+**Prohibited to resend**:
+- Status exists with state=acknowledged/started/in_progress
+- Same ack_id already sent Final
+- No clear evidence of Transport Timeout
+
+**Batch Replay Rules**:
+- ✅ Allowed: Root cause fixed + full status check
+- ❌ Prohibited: Root cause unknown, state=in_progress, no ack_id list
+
+### 16.4 Idempotency
+
+**ACK Once, Final Once**:
+- One ACK per ack_id
+- One Final per ack_id
+
+**Duplicate Detection**:
+1. Check `shared-context/job-status/{ack_id}.json`
+2. Check `task-log.jsonl` for existing ack_id
+
+**Duplicate Suppression**:
+```python
+if status_file_exists():
+    if state in ["acknowledged", "started", "in_progress"]:
+        return cached_ack  # Task in progress
+    elif state in ["completed", "failed"]:
+        return cached_final  # Task complete
+```
+
+### 16.5 Observability
+
+**Three "Incomplete" States**:
+
+| State | Detection | Meaning |
+|-------|-----------|---------|
+| Sent but no ACK | No status file, gateway log shows sent | Message in transit or pending |
+| ACK'd but not delivered | Status=acknowledged, no artifacts | Agent processing queued |
+| Delivered but not closed | Artifacts exist, status non-terminal | Task done, notification lost (T4) |
+
+### 16.6 Incident Playbook: Fixing Label Path Misuse
+
+**Symptom**: Messages sent via `message.send(label=...)`, agent not responding
+
+**Root Cause**: Internal control using Messaging Plane instead of Control Plane
+
+**Fix Steps**:
+1. Confirm issue: Check if using `message.send` instead of `sessions_send`
+2. Fix canonical path: Change to `sessions_send(sessionKey="agent:{id}:{type}")`
+3. Verify fix: Send test message, check status file generation
+4. Batch replay if needed: Only resend confirmed failures with original ack_id
+
+### 16.7 Prohibitions
+
+| Prohibited | Reason |
+|------------|--------|
+| Retry immediately after timeout | Could be T2/T3/T4, causes duplicate execution |
+| Resend same ack_id more than once | Cannot distinguish idempotent vs duplicate |
+| Batch replay with unknown root cause | May repeat failures |
+| Use message.send for internal control | Messaging Plane unreliable |
+| Rely on label for canonical addressing | Label is fallback, not precise |
+
+---
+
+## Appendix Z: Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v4.1 | 2026-03-14 | Add §16 Error Governance & Timeout Semantics (incident-driven) |
+| v4.0 | 2026-03-13 | ACK-First mandatory + Plugin auto-intercept |
+| v3.0 | 2026-03-12 | Unified internal ACP and external async |
+| v2.0 | 2026-03-10 | Plane separation (Control vs Messaging) |
