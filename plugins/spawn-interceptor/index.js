@@ -1,8 +1,12 @@
 /**
- * spawn-interceptor v3.3.0 — OpenClaw plugin for ACP task tracking + notification.
+ * spawn-interceptor v3.4.0 — OpenClaw plugin for ACP task tracking + notification.
  *
  * Based on v2.5.2 from github.com/lanyasheng/openclaw-multiagent-framework
  *
+ * v3.4.0: Fix progress relay only sending once. Split readProgress into full
+ *   (for completion notifications) vs incremental (for periodic relay). Full
+ *   reads entire transcript without offset tracking. Also filter "Started ..."
+ *   from incremental relay to avoid sending useless start messages.
  * v3.3.0: Fix completion report truncation + include transcript in completion.
  * v3.2.0: Transcript fallback for Issue #45205.
  *   - OpenClaw's parentStreamRelay has a known bug (#45205): ACP child runs in
@@ -22,7 +26,7 @@
  *   - before_prompt_build: inject completion report into agent's next turn
  *
  * Background:
- *   - Progress relay (30s): read acp-stream.jsonl, send progress to Discord
+ *   - Progress relay (15s tick, adaptive rate): read acp-stream.jsonl, send progress to Discord
  *   - ACP session poller: detect closed sessions as completion (L2)
  *   - Stale reaper: timeout tasks stuck > 30min (L3)
  *   - ACPX zombie cleanup: close dead acpx sessions
@@ -41,7 +45,7 @@ const ACPX_INDEX = path.join(ACPX_SESSIONS_DIR, "index.json");
 const STALE_TIMEOUT_MS = 30 * 60 * 1000;
 const REAPER_INTERVAL_MS = 5 * 60 * 1000;
 const ACP_POLL_INTERVAL_MS = 15 * 1000;
-const PROGRESS_RELAY_INTERVAL_MS = 30 * 1000;
+const PROGRESS_RELAY_INTERVAL_MS = 15 * 1000;
 
 
 
@@ -55,6 +59,7 @@ let pluginConfig = null;
 let consumedAcpSessionIds = new Set();
 let completedTasksSinceLastPrompt = [];
 let lastProgressReadOffset = {};
+let lastRelaySentAt = {};
 
 // --- Persistence ---
 
@@ -229,20 +234,61 @@ function readProgressFromTranscript(transcriptPath, sessionId) {
   } catch { return null; }
 }
 
-function readProgress(task, taskId) {
-  // L1: try native relay's acp-stream.jsonl
+function readProgressFull(task, taskId) {
+  if (!task.streamLogPath) return null;
+  const transcriptPath = resolveTranscriptPath(task.streamLogPath);
+  if (transcriptPath) {
+    try {
+      if (!fs.existsSync(transcriptPath)) return null;
+      const buf = fs.readFileSync(transcriptPath, "utf-8");
+      const lines = buf.split("\n").filter(Boolean);
+      const chunks = [];
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.type !== "message") continue;
+          const msg = entry.message;
+          if (!msg || msg.role !== "assistant") continue;
+          const content = msg.content;
+          if (typeof content === "string") chunks.push(content);
+          else if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === "text" && block.text) chunks.push(block.text);
+            }
+          }
+        } catch { continue; }
+      }
+      if (chunks.length === 0) return null;
+      const combined = chunks.join("\n").trim();
+      if (!combined) return null;
+      return { text: combined, isDone: false };
+    } catch { return null; }
+  }
+  return null;
+}
+
+function readProgressIncremental(task, taskId) {
   if (task.streamLogPath) {
     const streamResult = readProgressFromStreamLog(task.streamLogPath, taskId);
-    if (streamResult && !streamResult.text.includes("has produced no output for")) {
-      return streamResult;
+    if (streamResult) {
+      if (streamResult.text.includes("has produced no output for")
+          || streamResult.text.startsWith("Started ")) {
+        pluginLogger?.info(`spawn-interceptor: L1 filtered (${streamResult.text.slice(0, 60)}...), fallback to L2`);
+      } else {
+        return streamResult;
+      }
     }
   }
-  // L2 fallback: read child transcript directly (workaround for #45205)
   if (task.streamLogPath) {
     const transcriptPath = resolveTranscriptPath(task.streamLogPath);
     if (transcriptPath) {
       const transcriptResult = readProgressFromTranscript(transcriptPath, taskId);
-      if (transcriptResult) return transcriptResult;
+      if (transcriptResult) {
+        pluginLogger?.info(`spawn-interceptor: L2 transcript fallback success, ${transcriptResult.text.length} chars`);
+        return transcriptResult;
+      } else {
+        pluginLogger?.info(`spawn-interceptor: L2 transcript fallback - no new content`);
+      }
     }
   }
   return null;
@@ -257,13 +303,35 @@ async function relayProgress() {
   );
   if (acpTasks.length === 0) return;
 
+  pluginLogger?.info(`spawn-interceptor: relayProgress checking ${acpTasks.length} ACP task(s)`);
+
+  const now = Date.now();
+
   for (const [taskId, task] of acpTasks) {
     const rawTarget = task.discordThreadId || task.discordChannelId;
     if (!rawTarget) continue;
     const target = String(rawTarget).match(/^\d+$/) ? `channel:${rawTarget}` : String(rawTarget);
 
-    const progress = readProgress(task, taskId);
-    if (!progress) continue;
+    // Adaptive relay: shorter intervals for fresh tasks, longer for long-running
+    const taskAge = now - new Date(task.spawnedAt).getTime();
+    const lastSent = lastRelaySentAt[taskId] || 0;
+    const sinceLastSent = now - lastSent;
+    let minInterval;
+    if (taskAge < 2 * 60 * 1000) {
+      minInterval = 0; // first 2 min: send every tick
+    } else if (taskAge < 10 * 60 * 1000) {
+      minInterval = 60 * 1000; // 2-10 min: every 60s
+    } else {
+      minInterval = 5 * 60 * 1000; // 10+ min: every 5 min
+    }
+    if (lastSent > 0 && sinceLastSent < minInterval) continue;
+
+    pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - reading progress (age=${Math.round(taskAge/1000)}s, interval=${Math.round(minInterval/1000)}s)`);
+    const progress = readProgressIncremental(task, taskId);
+    if (!progress) {
+      pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - no incremental progress found`);
+      continue;
+    }
 
     try {
       const emoji = progress.isDone ? "✅" : "🔄";
@@ -274,6 +342,7 @@ async function relayProgress() {
         cfg: pluginConfig,
         accountId: task.discordAccountId || undefined,
       });
+      lastRelaySentAt[taskId] = now;
       pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} sent to ${target}`);
     } catch (err) {
       pluginLogger?.warn(`spawn-interceptor: relayProgress failed for ${taskId}: ${err?.message}`);
@@ -329,7 +398,7 @@ function reapStaleTasks() {
   for (const [taskId, task] of [...pendingTasks.entries()]) {
     const spawnedAt = new Date(task.spawnedAt).getTime();
     if (now - spawnedAt > STALE_TIMEOUT_MS) {
-      const progress = readProgress(task, taskId);
+      const progress = readProgressFull(task, taskId);
       const summary = progress?.text || "";
       pendingTasks.delete(taskId);
       appendLog({
@@ -452,7 +521,7 @@ function pollAcpSessions() {
       if (entry.closed || detail.closed_at) {
         consumedAcpSessionIds.add(entry.acpxRecordId);
 
-        const progress = readProgress(task, taskId);
+        const progress = readProgressFull(task, taskId);
         const summary = progress?.text || "";
 
         pendingTasks.delete(taskId);
@@ -477,7 +546,7 @@ function pollAcpSessions() {
 
 const spawnInterceptorPlugin = {
   name: "spawn-interceptor",
-  version: "3.3.0",
+  version: "3.4.0",
 
   register(api) {
     pluginLogger = api.logger;
@@ -681,7 +750,7 @@ const spawnInterceptorPlugin = {
       const completionStatus = outcome === "ok" || reason === "subagent-complete" ? "completed" : "failed";
 
       if (matchedTaskId && matchedTask) {
-        const progress = readProgress(matchedTask, matchedTaskId);
+        const progress = readProgressFull(matchedTask, matchedTaskId);
         const summary = progress?.text || "";
         pendingTasks.delete(matchedTaskId);
         savePending();
@@ -712,6 +781,7 @@ const spawnInterceptorPlugin = {
     if (progressRelayTimer) { clearInterval(progressRelayTimer); progressRelayTimer = null; }
     consumedAcpSessionIds.clear();
     lastProgressReadOffset = {};
+    lastRelaySentAt = {};
     pluginLogger = null;
     pluginRuntime = null;
     pluginConfig = null;

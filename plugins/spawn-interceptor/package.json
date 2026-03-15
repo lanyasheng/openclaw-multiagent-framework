@@ -1,8 +1,8 @@
 {
   "name": "spawn-interceptor",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "type": "module",
-  "description": "Task tracking, streamTo parent injection, transcript fallback, and full completion reports via Discord",
+  "description": "Task tracking with adaptive progress relay, transcript fallback, and full Discord completion reports",
   "main": "index.js",
   "keywords": [
     "openclaw",
@@ -16,5 +16,8 @@
     "extensions": [
       "./index.js"
     ]
+  },
+  "scripts": {
+    "test": "node test.js"
   }
 }
