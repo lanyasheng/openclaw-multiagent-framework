@@ -1,8 +1,10 @@
 /**
- * spawn-interceptor v3.4.0 — OpenClaw plugin for ACP task tracking + notification.
+ * spawn-interceptor v3.5.0 — OpenClaw plugin for ACP task tracking + notification.
  *
  * Based on v2.5.2 from github.com/lanyasheng/openclaw-multiagent-framework
  *
+ * v3.5.0: Immediate start notification on task tracked. Heartbeat message
+ *   when stream shows "no output for 60s" but transcript has no new content.
  * v3.4.0: Fix progress relay only sending once. Split readProgress into full
  *   (for completion notifications) vs incremental (for periodic relay). Full
  *   reads entire transcript without offset tracking. Also filter "Started ..."
@@ -268,11 +270,14 @@ function readProgressFull(task, taskId) {
 }
 
 function readProgressIncremental(task, taskId) {
+  let streamFiltered = false;
   if (task.streamLogPath) {
     const streamResult = readProgressFromStreamLog(task.streamLogPath, taskId);
     if (streamResult) {
-      if (streamResult.text.includes("has produced no output for")
-          || streamResult.text.startsWith("Started ")) {
+      if (streamResult.text.includes("has produced no output for")) {
+        pluginLogger?.info(`spawn-interceptor: L1 filtered (${streamResult.text.slice(0, 60)}...), fallback to L2`);
+        streamFiltered = true;
+      } else if (streamResult.text.startsWith("Started ")) {
         pluginLogger?.info(`spawn-interceptor: L1 filtered (${streamResult.text.slice(0, 60)}...), fallback to L2`);
       } else {
         return streamResult;
@@ -290,6 +295,11 @@ function readProgressIncremental(task, taskId) {
         pluginLogger?.info(`spawn-interceptor: L2 transcript fallback - no new content`);
       }
     }
+  }
+  // When both L1 and L2 have no content but stream showed a stall, emit a heartbeat
+  if (streamFiltered) {
+    const age = Math.round((Date.now() - new Date(task.spawnedAt).getTime()) / 1000);
+    return { text: `⏳ 任务执行中 (已运行 ${age}s，等待 AI 输出...)`, isDone: false };
   }
   return null;
 }
@@ -546,7 +556,7 @@ function pollAcpSessions() {
 
 const spawnInterceptorPlugin = {
   name: "spawn-interceptor",
-  version: "3.4.0",
+  version: "3.5.0",
 
   register(api) {
     pluginLogger = api.logger;
@@ -606,6 +616,16 @@ const spawnInterceptorPlugin = {
       savePending();
 
       api.logger.info(`spawn-interceptor: tracked ${id} (runtime=${rt}, discord=${discordChannelId || "none"}, pending=${pendingTasks.size})`);
+
+      // Immediately notify Discord about task start
+      if (rt === "acp" && discordChannelId && pluginRuntime?.channel?.discord?.sendMessageDiscord) {
+        const target = `channel:${discordChannelId}`;
+        const taskDesc = String(p.task || "").slice(0, 200);
+        pluginRuntime.channel.discord.sendMessageDiscord(target, `🚀 **ACP 任务开始** (${id.slice(-8)})\n> ${taskDesc}`, {
+          cfg: pluginConfig,
+          accountId: taskEntry.discordAccountId || undefined,
+        }).catch(() => {});
+      }
 
       if (rt === "acp" && p.task) {
         const nextParams = { ...p, task: p.task + relay(id, ctx.sessionKey) };

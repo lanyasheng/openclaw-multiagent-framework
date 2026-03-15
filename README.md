@@ -91,7 +91,7 @@ Our completion detection uses a **four-layer defensive architecture** that handl
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    COMPLETION DETECTION PIPELINE v3.3                        │
+│                    COMPLETION DETECTION PIPELINE v3.5                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  LAYER 1: Native Event Stream (OpenClaw)                                   │
@@ -414,7 +414,7 @@ This framework will remain **honest about its scope**:
 
 ---
 
-### spawn-interceptor Plugin (v3.3.0)
+### spawn-interceptor Plugin (v3.5.0)
 
 An OpenClaw plugin (~300 lines of JavaScript) that:
 
@@ -431,7 +431,7 @@ Agent calls sessions_spawn()
          │
          ▼
 ┌─────────────────────────────────────────────────┐
-│             spawn-interceptor v3.3.0              │
+│             spawn-interceptor v3.5.0              │
 │          (OpenClaw Plugin, ~250 lines)          │
 ├─────────────────────────────────────────────────┤
 │                                                 │
@@ -626,7 +626,7 @@ sessions_spawn(
 ```
 ├── plugins/
 │   └── spawn-interceptor/        # OpenClaw plugin (~250 lines)
-│       ├── index.js              # v3.3.0: hooks + completion pipeline
+│       ├── index.js              # v3.5.0: hooks + completion pipeline
 │       ├── package.json          # Plugin metadata
 │       └── openclaw.plugin.json  # OpenClaw plugin manifest
 ├── examples/

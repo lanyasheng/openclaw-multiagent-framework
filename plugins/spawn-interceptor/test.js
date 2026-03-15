@@ -184,11 +184,13 @@ function readProgressFull(task, taskId) {
 }
 
 function readProgressIncremental(task, taskId) {
+  let streamFiltered = false;
   if (task.streamLogPath) {
     const streamResult = readProgressFromStreamLog(task.streamLogPath, taskId);
     if (streamResult) {
-      if (streamResult.text.includes("has produced no output for")
-          || streamResult.text.startsWith("Started ")) {
+      if (streamResult.text.includes("has produced no output for")) {
+        streamFiltered = true;
+      } else if (streamResult.text.startsWith("Started ")) {
         // filtered, fallback to L2
       } else {
         return streamResult;
@@ -201,6 +203,10 @@ function readProgressIncremental(task, taskId) {
       const transcriptResult = readProgressFromTranscript(transcriptPath, taskId);
       if (transcriptResult) return transcriptResult;
     }
+  }
+  if (streamFiltered) {
+    const age = Math.round((Date.now() - new Date(task.spawnedAt).getTime()) / 1000);
+    return { text: `⏳ 任务执行中 (已运行 ${age}s，等待 AI 输出...)`, isDone: false };
   }
   return null;
 }
@@ -750,7 +756,7 @@ test("E2E: completion uses readProgressFull to get all output", () => {
   assert.ok(full.text.includes("Task completed successfully"), "Should include final content");
 });
 
-test("E2E: 'no output for 60s' stream message + no transcript → null", () => {
+test("E2E: 'no output for 60s' stream message + no transcript → heartbeat", () => {
   lastProgressReadOffset = {};
   const dir = path.join(TEMP_DIR, "e2e3");
   fs.mkdirSync(dir, { recursive: true });
@@ -764,9 +770,11 @@ test("E2E: 'no output for 60s' stream message + no transcript → null", () => {
   ]);
 
   const streamLogPath = path.join(dir, "test.acp-stream.jsonl");
-  const task = { streamLogPath };
+  const task = { streamLogPath, spawnedAt: new Date(Date.now() - 90000).toISOString() };
   const r = readProgressIncremental(task, "e2e3");
-  assert.strictEqual(r, null, "Should be null when no assistant output anywhere");
+  assert.ok(r, "Should return heartbeat when stream shows stall but no transcript output");
+  assert.ok(r.text.includes("任务执行中"), "Heartbeat should contain status message");
+  assert.strictEqual(r.isDone, false);
 });
 
 test("E2E: rapid task completion within single relay interval", () => {

@@ -28,7 +28,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    COMPLETION DETECTION PIPELINE v2.5                        │
+│                    COMPLETION DETECTION PIPELINE v3.5                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  LAYER 1: Native Event Stream (OpenClaw)                                   │
@@ -150,7 +150,7 @@ To compensate for these issues, we built `task-callback-bus`:
 
 **Problems**: High complexity, watcher reporting degraded, 0 actual notifications sent, all owners unknown.
 
-### Phase 3: Plugin-Based Solution (Current v2.5)
+### Phase 3: Plugin-Based Solution (Current v3.5)
 
 **Core insight**: If a behavior is mandatory, it should be a system constraint — not a documentation constraint.
 
@@ -164,7 +164,7 @@ To compensate for these issues, we built `task-callback-bus`:
 | v2.2 | sessions/index.json polling | Works but delay too high (5 min) |
 | v2.3 | ACP session poller (~15s) | **Working solution** — poll `~/.acpx/sessions/` |
 | v2.4 | spawn-interceptor + poller + reaper | **Current production** — four-layer pipeline |
-| v2.5 | + content-aware-completer | **Latest** — content evidence validation |
+| v3.5 | + content-aware-completer | **Latest** — content evidence validation |
 
 ### Design Philosophy Shift
 
@@ -339,7 +339,7 @@ Agent A ──message.send("分析BTC")──▶ #trading-channel
 | v2.2 | 2026-03-12 | sessions/index.json polling |
 | v2.3 | 2026-03-13 | ACP session poller (~15s) |
 | v2.4 | 2026-03-13 | spawn-interceptor + four-layer pipeline |
-| v2.5 | 2026-03-13 | + content-aware-completer (L4) |
+| v3.5 | 2026-03-13 | + content-aware-completer (L4) |
 | v2.6 | 2026-03-14 | + Troubleshooting: message delivered but no ACK |
 
 ---

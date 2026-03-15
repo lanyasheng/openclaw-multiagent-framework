@@ -1,115 +1,135 @@
 # spawn-interceptor
 
-OpenClaw plugin that automatically tracks task spawns, injects `streamTo: "parent"`, and detects completion with transcript fallback and full Discord notifications.
+> Zero-config OpenClaw plugin for ACP task lifecycle management. Tracks spawns, relays progress, detects completion, and notifies Discord — without any agent-side code changes.
 
-## Problem
+## The Problem
 
-When agents call `sessions_spawn(runtime="acp")`, they often forget to register the task. This means:
-- No one tracks whether the ACP task completed
-- No completion notification is sent to the user
-- Tasks fall into a "black hole"
+OpenClaw's ACP (Agent Cloud Platform) has three fundamental gaps:
 
-## Solution
+1. **No completion signal** — `sessions_spawn(runtime="acp")` returns immediately. When the child finishes, nothing happens. No callback, no event, no webhook.
+2. **Broken event relay** — `parentStreamRelay` has a cross-process bug ([#45205](https://github.com/openclaw/openclaw/issues/45205)): ACP runs in a gateway subprocess, so `onAgentEvent` never crosses the process boundary. Only synthetic `start`/`stall` notices reach the parent.
+3. **Zombie accumulation** — Dead sessions stay `closed: false` in `~/.acpx/sessions/index.json`, consuming `maxConcurrentSessions` slots until manual restart.
 
-This plugin uses OpenClaw hooks to:
+Result: agents dispatch tasks into a black hole with zero visibility.
 
-1. **Automatically log** every `sessions_spawn` call to `task-log.jsonl`
-2. **Inject** `streamTo: "parent"` and `taskId` into ACP prompts (parentStreamRelay)
-3. **Detect completion** via ACP session poller, stale reaper, and subagent_ended
-4. **Fallback chain** for output: native acp-stream.jsonl → child transcript .jsonl
-5. **Full completion reports** to Discord (no truncation)
-6. **Adaptive relay frequency** to avoid message flooding during long tasks
-
-## Architecture (v3.4.0)
+## Architecture
 
 ```
-Hooks:
-  before_tool_call       → inject streamTo + taskId
-  after_tool_call        → link ACP session + streamLogPath
-  subagent_spawning/spawned → Discord context enrichment
-  subagent_ended         → L1 completion detection
-  before_prompt_build    → completion report injection
-
-Background:
-  Progress relay (15s tick, adaptive rate)
-    - <2min: every tick (15s)
-    - 2-10min: every 60s
-    - >10min: every 5min
-  ACP session poller (15s)
-  Stale reaper (5min)
-  ACPX zombie cleanup
-
-Progress reading:
-  Incremental (for relay):
-    L1: acp-stream.jsonl (filters "Started ..." and "no output" messages)
-    L2: child transcript .jsonl (fallback for Issue #45205)
-  Full (for completion):
-    Reads entire transcript without offset tracking (idempotent)
+┌─────────────────── spawn-interceptor v3.5.0 ───────────────────┐
+│                                                                 │
+│  HOOKS (system-level interception)                              │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ before_tool_call   → inject streamTo + taskId + relay    │   │
+│  │ after_tool_call    → link ACP session + streamLogPath    │   │
+│  │ subagent_spawning  → enrich with Discord context         │   │
+│  │ subagent_spawned   → precise session key binding         │   │
+│  │ subagent_ended     → L1 completion detection             │   │
+│  │ before_prompt_build→ inject completion report            │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  BACKGROUND WORKERS                                             │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Progress relay (15s tick, adaptive rate)                  │   │
+│  │   <2min: every tick │ 2-10min: 60s │ >10min: 5min        │   │
+│  │                                                          │   │
+│  │ ACP session poller (15s) → L2 completion detection       │   │
+│  │ Stale reaper (5min) → L3 timeout fallback                │   │
+│  │ ACPX zombie cleanup → close dead sessions                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  PROGRESS READING (dual-mode)                                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Incremental (relay):                                     │   │
+│  │   L1: acp-stream.jsonl → filter noise → assistant_delta  │   │
+│  │   L2: child .jsonl transcript → offset-tracked fallback  │   │
+│  │   Heartbeat: stall detected → emit status message        │   │
+│  │                                                          │   │
+│  │ Full (completion):                                       │   │
+│  │   Read entire transcript → no offset → idempotent        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  OUTPUT                                                         │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ task-log.jsonl      → single source of truth             │   │
+│  │ .pending-tasks.json → survives gateway restart           │   │
+│  │ Discord messages    → start / progress / completion      │   │
+│  │ Prompt injection    → inform parent agent                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Design Decisions
+## Design Decisions
 
-### Why two read modes? (readProgressFull vs readProgressIncremental)
+### Why plugin hooks instead of wrapper functions?
 
-The incremental reader tracks file offsets to avoid re-sending already-relayed content.
-But completion notifications need the *full* task output regardless of what was already relayed.
-v3.3.0 used a single `readProgress` for both paths — this caused completion reports to be empty
-when relay had already consumed the offset. v3.4.0 splits them into separate functions.
+Agents have "muscle memory" from training. They call `sessions_spawn` directly — a native OpenClaw tool trained millions of times. Wrapper functions like `spawn_with_tracking()` get skipped. Even `MUST`/`P0`/`NON-NEGOTIABLE` prompt directives fail. System-level `before_tool_call` hooks are invisible to the agent — **impossible to bypass**.
 
-### Why filter "Started ..." from relay?
+### Why two read modes?
 
-OpenClaw's `parentStreamRelay` emits a synthetic `system_event` ("Started claude session ...")
-as the first message. This is not useful progress — relaying it just sends noise to Discord.
-Due to Issue #45205, no `assistant_delta` events follow in the stream log, so the stream log
-is effectively useless for progress. The transcript fallback (L2) provides real assistant output.
+v3.3 used one `readProgress` for both relay and completion. Relay consumed the file offset, then completion found nothing left to read — empty completion reports. v3.4+ splits into:
+
+- **`readProgressIncremental`**: offset-tracked, avoids re-sending. Filters noise ("Started ...", "no output for 60s"). Used by periodic relay.
+- **`readProgressFull`**: reads entire transcript from byte 0. Idempotent. Used by all completion paths.
 
 ### Why adaptive relay frequency?
 
-Fixed 15s relay works well for short tasks (<2min), but long-running tasks (10-60min) would
-flood Discord with dozens of progress messages. The adaptive strategy throttles relay frequency
-based on task age, keeping early visibility while reducing noise for long tasks.
+Fixed 15s relay floods Discord during 30-minute tasks (120+ messages). Adaptive rate:
+
+| Task age | Relay interval | Rationale |
+|----------|---------------|-----------|
+| < 2 min  | Every 15s tick | Maximum visibility for short tasks |
+| 2–10 min | Every 60s | Reduce noise, still responsive |
+| > 10 min | Every 5 min | Summary-level updates only |
+
+### Why heartbeat messages?
+
+Due to #45205, `acp-stream.jsonl` only contains `system_event` entries (start, stall). No `assistant_delta`. The transcript `.jsonl` only writes assistant messages at turn completion — not during tool execution. For single-turn tasks, there's zero intermediate output. When stream shows "no output for 60s" but transcript has nothing, we emit a heartbeat so users know the task is alive.
 
 ## Version History
 
-- **v3.4.0**: Split readProgress into full (completion) vs incremental (relay). Adaptive relay
-  frequency. Filter "Started ..." messages from relay. Debug logging for relay diagnostics.
-- **v3.3.0**: Full completion reports; all completion paths read transcript before delete.
-- **v3.2.0**: Transcript fallback for Issue #45205.
-- **v3.1.0**: Restored progress polling with `readProgressFromStreamLog`.
-- **v3.0.0**: Simplified; introduced `streamTo: "parent"` injection.
+| Version | Key Changes |
+|---------|-------------|
+| **v3.5.0** | Immediate start notification. Heartbeat on stall. |
+| **v3.4.0** | Split full/incremental read. Adaptive relay. 42 unit tests. |
+| **v3.3.0** | Full transcript in completion reports. Remove message truncation. |
+| **v3.2.0** | Transcript fallback for #45205. |
+| **v3.1.0** | Restore progress polling via acp-stream.jsonl. |
+| **v3.0.0** | Simplify to `streamTo: "parent"` injection. |
 
 ## Testing
 
 ```bash
-node test.js
-# 42 tests covering all core functions and E2E scenarios
+node test.js  # 42 tests, ~500ms
 ```
+
+Covers: `readProgressFromStreamLog`, `readProgressFromTranscript`, `readProgressFull`, `readProgressIncremental`, `extractChildSessionKey`, `extractStreamLogPath`, `parseDiscordChannelFromSessionKey`, `resolveTranscriptPath`, `genId`, plus 5 end-to-end scenarios.
 
 ## Installation
 
 ```bash
 cp -r plugins/spawn-interceptor ~/.openclaw/plugins/
+```
 
-# Add to openclaw.json
+```json
 {
   "plugins": {
     "allow": ["spawn-interceptor"],
-    "entries": {
-      "spawn-interceptor": { "enabled": true }
-    }
+    "entries": { "spawn-interceptor": { "enabled": true } }
   }
 }
 ```
 
-## Limitations
+## Known Limitations
 
-- ACP completion depends on poller/reaper/transcript fallback (native relay unreliable due to #45205)
-- Transcript file must exist on same host (local deployment only)
-- Progress relay adds 15s latency compared to real-time streaming
+- **Single-turn ACP tasks**: No intermediate progress (transcript writes only at turn completion). Heartbeat messages provide liveness signal.
+- **Same-host only**: File system polling requires all processes on one machine.
+- **acpx dependency**: If `kill -9` bypasses acpx cleanup, poller can't detect completion.
+- **No auto-retry**: Detects and reports failure, doesn't retry. Retry is orchestrator's responsibility.
 
 ## Related
 
-- [COMMUNICATION_ISSUES.md](../../COMMUNICATION_ISSUES.md) — Full problem analysis
-- OpenClaw Issue #45205 — ACP onAgentEvent cross-process bug
-- OpenClaw Issue #5943 — before_tool_call wiring
-- OpenClaw PR #45739 — Proposed gateway fallback (chat.history + agent.wait)
+- [COMMUNICATION_ISSUES.md](../../COMMUNICATION_ISSUES.md) — Problem analysis
+- OpenClaw [#45205](https://github.com/openclaw/openclaw/issues/45205) — Cross-process event bug
+- OpenClaw [#40272](https://github.com/openclaw/openclaw/issues/40272) — notifyChannel ignored
+- OpenClaw [PR #46308](https://github.com/openclaw/openclaw/pull/46308) — ACP lifecycle registration
+- OpenClaw [PR #46949](https://github.com/openclaw/openclaw/pull/46949) — Back-pressure eviction
