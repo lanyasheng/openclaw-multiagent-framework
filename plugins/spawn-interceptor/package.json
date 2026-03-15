@@ -1,6 +1,6 @@
 {
   "name": "spawn-interceptor",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "type": "module",
   "description": "Task tracking with adaptive progress relay, transcript fallback, and full Discord completion reports",
   "main": "index.js",
