@@ -291,15 +291,18 @@ async function wakeParentSession(task, status, summary) {
   }
 
   // Strategy 2: openclaw agent CLI with --session-id (works outside request context)
+  // Resolve the correct Discord channel from parentSessionKey to avoid routing to the default channel.
   try {
     const { exec } = require("child_process");
     const escapedMsg = msg.replace(/'/g, "'\\''");
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.npm-global/bin:$PATH"; openclaw agent --session-id '${parentSessionKey}' --message '${escapedMsg}' --deliver --channel discord 2>&1`;
+    const channelId = parseDiscordChannelFromSessionKey(parentSessionKey);
+    const channelArg = channelId ? `--to 'channel:${channelId}' --channel discord` : "--channel discord";
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.npm-global/bin:$PATH"; openclaw agent --session-id '${parentSessionKey}' --message '${escapedMsg}' --deliver ${channelArg} 2>&1`;
     exec(cmd, { timeout: 60000, env: { ...process.env, PATH: "/opt/homebrew/bin:" + (process.env.HOME || "") + "/.npm-global/bin:" + (process.env.PATH || "") } }, (err, stdout) => {
       if (err) {
         pluginLogger?.warn(`spawn-interceptor: CLI parent wake failed: ${err.message}${stdout ? " stdout=" + stdout.slice(0, 200) : ""}`);
       } else {
-        pluginLogger?.info(`spawn-interceptor: woke parent via CLI (sessionId=${parentSessionKey})`);
+        pluginLogger?.info(`spawn-interceptor: woke parent via CLI (sessionId=${parentSessionKey}, channel=${channelId || "default"})`);
       }
     });
   } catch (err) {
