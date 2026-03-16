@@ -1,10 +1,10 @@
 # OpenClaw 多智能体协作框架
 
-> 一套经过生产环境验证的多智能体协作协议和架构。解决 ACP 通信不可靠、Agent 忘记注册任务、超时语义模糊等核心问题，通过零配置的插件系统实现。
+> 一套经过生产环境验证的多智能体协作协议和架构。解决 ACP 通信不可靠、Agent 忘记注册任务、超时语义模糊等核心问题，通过零配置的插件系统实现。包含轻量级 subagent + Claude Code CLI runner 作为稳定的 ACP 替代方案。
 
 [English Version](README.md)
 
-**版本**: 2026-03-13-v9 | **许可证**: MIT | **状态**: 生产可用
+**版本**: 2026-03-16-v10 | **许可证**: MIT | **状态**: 生产可用
 
 ---
 
@@ -556,6 +556,39 @@ python3 examples/content-aware-completer/content_aware_completer.py --once
 
 ---
 
+## 替代方案：Subagent + Claude Code CLI
+
+如果 ACP 的僵尸会话、并发死锁和跨进程事件丢失阻碍了你，有一条更简单的路：直接绕过 ACP。
+
+不走 `sessions_spawn(runtime="acp")` -> acpx -> Claude Code Agent -> Claude Code CLI 这四层调用链（每层有独立的会话管理），而是用 `sessions_spawn(runtime="subagent")` + `exec claude --print`（两层，Gateway 直管）。
+
+### 关键区别
+
+| 问题 | ACP | Subagent + CLI |
+|------|-----|----------------|
+| 僵尸会话 | 常见（进程退出后 session 不关闭） | 不可能（CLI 退出 = 完成） |
+| 并发死锁 | `maxConcurrentSessions` 耗尽 | 没有 session 池概念 |
+| 跨进程事件 | `onAgentEvent` 只在本进程生效 | 无跨进程依赖 |
+| 完成检测 | 5 层轮询管线（~960 行） | 原生 `subagent_ended`（0 行额外代码） |
+| 进程清理 | 手动 acpx GC | 双超时看门狗 + SIGTERM->SIGKILL |
+
+### 快速开始
+
+```bash
+# 在 Agent 中通过 exec 运行 v1 脚本：
+bash scripts/run_v1.sh "你的编码任务" "task-label"
+```
+
+详见 [examples/subagent-claude-runner/README.md](examples/subagent-claude-runner/README.md)。
+
+### 局限
+
+- **CLI 降级延迟**：完成通知有 ~20s 延迟（`subagent.run()` 在非 request context 中不可用，降级到 CLI）
+- **无中间进度**：Claude Code transcript 在 LLM turn 边界才写入。需要显式 `MILESTONE:` 标记
+- **单次执行**：`claude --print` 是单次执行，不支持多轮交互。交互式场景仍需 ACP
+
+---
+
 ## 已知 OpenClaw Bug
 
 这个框架的存在部分原因是 OpenClaw 中以下未解决的 bug：
@@ -634,6 +667,12 @@ sessions_spawn(
 │   ├── content-aware-completer/  # 第4层完成验证
 │   │   ├── content_aware_completer.py
 │   │   └── tests/
+│   ├── subagent-claude-runner/    # ACP 替代方案：subagent + Claude Code CLI
+│   │   ├── runner.js             # CLI 进程管理器（双超时看门狗）
+│   │   ├── run_v1.sh             # 阻塞式编排脚本
+│   │   ├── watcher.js            # 可选的进度监控
+│   │   ├── cleanup.sh            # 运行目录垃圾回收
+│   │   └── README.md             # 安装和使用指南
 │   ├── l2_capabilities.py        # L2 能力实现演示
 │   └── protocol_messages.py      # 协议消息格式演示
 ├── COMMUNICATION_ISSUES.md       # 核心设计文档

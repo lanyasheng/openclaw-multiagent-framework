@@ -1,10 +1,10 @@
 # OpenClaw Multi-Agent Collaboration Framework
 
-> A battle-tested multi-agent collaboration protocol and architecture for OpenClaw. Solves unreliable ACP communication, agent task-registration amnesia, and ambiguous timeout semantics with a zero-config plugin system.
+> A battle-tested multi-agent collaboration protocol and architecture for OpenClaw. Solves unreliable ACP communication, agent task-registration amnesia, and ambiguous timeout semantics with a zero-config plugin system. Includes a lightweight subagent + Claude Code CLI runner as a stable ACP alternative.
 
 [中文版 (Chinese README)](README_CN.md)
 
-**Version**: 2026-03-13-v9 | **License**: MIT | **Status**: Production Ready
+**Version**: 2026-03-16-v10 | **License**: MIT | **Status**: Production Ready
 
 ---
 
@@ -558,6 +558,39 @@ See [QUICKSTART.md](QUICKSTART.md) for the full deployment guide.
 
 ---
 
+## Alternative: Subagent + Claude Code CLI
+
+If ACP's zombie sessions, concurrency deadlocks, and cross-process event loss are blocking you, there's a simpler path: bypass ACP entirely.
+
+Instead of `sessions_spawn(runtime="acp")` -> acpx -> Claude Code Agent -> Claude Code CLI (four layers, each with its own session management), use `sessions_spawn(runtime="subagent")` + `exec claude --print` (two layers, Gateway-managed).
+
+### Key Differences
+
+| Issue | ACP | Subagent + CLI |
+|-------|-----|----------------|
+| Zombie sessions | Common (session stays open after process exits) | Impossible (CLI exits = done) |
+| Concurrent deadlocks | `maxConcurrentSessions` exhaustion | No session pool |
+| Cross-process events | `onAgentEvent` only works in-process | No cross-process dependency |
+| Completion detection | 5-layer polling pipeline (~960 lines) | Native `subagent_ended` (0 extra lines) |
+| Process cleanup | Manual acpx GC | Dual timeout watchdog + SIGTERM->SIGKILL |
+
+### Quick Start
+
+```bash
+# From your agent, use exec to run the v1 wrapper:
+bash scripts/run_v1.sh "Your coding task here" "task-label"
+```
+
+See [examples/subagent-claude-runner/README.md](examples/subagent-claude-runner/README.md) for full setup and usage.
+
+### Trade-offs
+
+- **CLI fallback latency**: Completion notification has ~20s delay (spawn-interceptor falls back to CLI when `subagent.run()` is unavailable outside request context)
+- **No intermediate progress**: Claude Code transcript writes at LLM turn boundaries only. Milestones require explicit `MILESTONE:` markers
+- **Single-shot only**: `claude --print` is one-shot. For multi-turn interactive sessions, ACP is still needed
+
+---
+
 ## Known OpenClaw Bugs
 
 This framework exists partly because of these unresolved bugs in OpenClaw:
@@ -636,6 +669,12 @@ sessions_spawn(
 │   ├── content-aware-completer/  # Layer 4 completion validation
 │   │   ├── content_aware_completer.py
 │   │   └── tests/
+│   ├── subagent-claude-runner/    # ACP alternative: subagent + Claude Code CLI
+│   │   ├── runner.js             # CLI process manager with dual timeout watchdog
+│   │   ├── run_v1.sh             # Blocking orchestration wrapper
+│   │   ├── watcher.js            # Optional progress monitor
+│   │   ├── cleanup.sh            # Run directory garbage collection
+│   │   └── README.md             # Setup and usage guide
 │   ├── l2_capabilities.py        # L2 capability implementations
 │   └── protocol_messages.py      # Protocol message format demo
 ├── COMMUNICATION_ISSUES.md       # Core design document
