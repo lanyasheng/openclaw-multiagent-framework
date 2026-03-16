@@ -16,6 +16,10 @@ import {
   enqueueCompletedTask,
   findStreamFileForSessionEntries,
   getCompletionQueueKey,
+  isIgnorableSystemProgress,
+  readCompletionEvidence,
+  readProgressFromTranscript as actualReadProgressFromTranscript,
+  resolveTranscriptPath as actualResolveTranscriptPath,
 } from "./index.js";
 
 const TEMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "spawn-interceptor-test-"));
@@ -912,6 +916,25 @@ test("classifyClosedAcpSession defers young suspected failure", () => {
   assert.strictEqual(result.finalStatus, "failed");
 });
 
+test("classifyClosedAcpSession defers completion for child session with only lifecycle events", () => {
+  const now = Date.now();
+  const created = new Date(now - 20_000).toISOString();
+  const result = classifyClosedAcpSession({
+    spawnTs: now - 20_000,
+    now,
+    created,
+    lastUsed: new Date(now - 5_000).toISOString(),
+    progress: "Started claude session abc. Streaming progress updates to parent session.",
+    hasMeaningfulOutput: false,
+    childSessionActive: true,
+    minChildSessionCompletionAgeMs: 600_000,
+  });
+
+  assert.strictEqual(result.isSuspectedFailure, false);
+  assert.strictEqual(result.shouldDeferCompletion, true);
+  assert.strictEqual(result.finalStatus, "completed");
+});
+
 test("classifyClosedAcpSession marks short task with real output as completed", () => {
   const now = Date.now();
   const created = new Date(now - 20_000).toISOString();
@@ -921,6 +944,7 @@ test("classifyClosedAcpSession marks short task with real output as completed", 
     created,
     lastUsed: created,
     progress: "ACP_RECOVERED and more than twenty chars",
+    hasMeaningfulOutput: true,
     minFailureAgeMs: 45_000,
   });
 
@@ -928,6 +952,60 @@ test("classifyClosedAcpSession marks short task with real output as completed", 
   assert.strictEqual(result.isSuspectedFailure, false);
   assert.strictEqual(result.shouldDeferFailure, false);
   assert.strictEqual(result.finalStatus, "completed");
+});
+
+test("isIgnorableSystemProgress detects started and stall lifecycle text", () => {
+  assert.strictEqual(isIgnorableSystemProgress("Started claude session abc."), true);
+  assert.strictEqual(isIgnorableSystemProgress("claude has produced no output for 60s."), true);
+  assert.strictEqual(isIgnorableSystemProgress("real assistant output"), false);
+});
+
+test("readProgressFromTranscript extracts assistant text blocks", () => {
+  const dir = path.join(TEMP_DIR, "completion-transcript");
+  fs.mkdirSync(dir, { recursive: true });
+  const transcriptPath = path.join(dir, "session.jsonl");
+  const lines = [
+    JSON.stringify({ type: "message", message: { role: "user", content: "query" } }),
+    JSON.stringify({ type: "message", message: { role: "assistant", content: "real final output" } }),
+  ];
+  fs.writeFileSync(transcriptPath, lines.join("\n") + "\n");
+  assert.strictEqual(actualReadProgressFromTranscript(transcriptPath), "real final output");
+});
+
+test("resolveTranscriptPath maps acp stream to transcript path", () => {
+  const dir = path.join(TEMP_DIR, "completion-path");
+  fs.mkdirSync(dir, { recursive: true });
+  const transcriptPath = path.join(dir, "session.jsonl");
+  fs.writeFileSync(transcriptPath, "{}\n");
+  const streamPath = path.join(dir, "session.acp-stream.jsonl");
+  assert.strictEqual(actualResolveTranscriptPath(streamPath), transcriptPath);
+});
+
+test("readCompletionEvidence ignores lifecycle-only stream without transcript", () => {
+  const dir = path.join(TEMP_DIR, "completion-evidence-system");
+  fs.mkdirSync(dir, { recursive: true });
+  const streamPath = writeStreamLog(dir, [
+    { kind: "system_event", text: "Started claude session abc. Streaming progress updates to parent session." },
+  ]);
+  const evidence = readCompletionEvidence({ streamLogPath: streamPath }, "agent:claude:acp:test");
+  assert.strictEqual(evidence.hasMeaningfulOutput, false);
+  assert.strictEqual(evidence.source, "system");
+});
+
+test("readCompletionEvidence prefers transcript assistant output when available", () => {
+  const dir = path.join(TEMP_DIR, "completion-evidence-transcript");
+  fs.mkdirSync(dir, { recursive: true });
+  const streamPath = writeStreamLog(dir, [
+    { kind: "system_event", text: "Started claude session abc. Streaming progress updates to parent session." },
+  ]);
+  writeTranscript(dir, [
+    { role: "user", content: "query" },
+    { role: "assistant", content: "final report written" },
+  ]);
+  const evidence = readCompletionEvidence({ streamLogPath: streamPath }, "agent:claude:acp:test");
+  assert.strictEqual(evidence.hasMeaningfulOutput, true);
+  assert.strictEqual(evidence.source, "transcript");
+  assert.ok(evidence.summary.includes("final report written"));
 });
 
 // ─── Summary ───

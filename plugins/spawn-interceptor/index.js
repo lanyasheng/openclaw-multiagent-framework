@@ -35,6 +35,7 @@ const ACP_POLL_INTERVAL_MS = 15 * 1000;
 const PROGRESS_RELAY_INTERVAL_MS = 15 * 1000;
 const PROGRESS_MAX_CHARS = 300;
 const SUSPECTED_FAILURE_GRACE_MS = 45 * 1000;
+const CHILD_SESSION_COMPLETION_GRACE_MS = 10 * 60 * 1000;
 
 let pendingTasks = new Map();
 let reaperTimer = null;
@@ -221,19 +222,104 @@ export function buildCompletionInjection(tasks) {
   return `\n\n[SYSTEM — ACP Task Completion Report]\nThe following ACP tasks have completed since your last turn:\n${lines.join("\n")}\n\nIf you have follow-up tasks to dispatch, please continue. Otherwise, report the results to the user.\n[END REPORT]`;
 }
 
+export function isIgnorableSystemProgress(text) {
+  if (typeof text !== "string") return true;
+  const normalized = text.trim();
+  if (!normalized) return true;
+  return normalized.startsWith("Started ") || normalized.includes("has produced no output for");
+}
+
+export function resolveTranscriptPath(streamLogPath) {
+  if (!streamLogPath || typeof streamLogPath !== "string") return null;
+  const transcriptPath = streamLogPath.replace(/\.acp-stream\.jsonl$/, ".jsonl");
+  if (transcriptPath === streamLogPath) return null;
+  return fs.existsSync(transcriptPath) ? transcriptPath : null;
+}
+
+export function readProgressFromTranscript(transcriptPath) {
+  try {
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+    const buf = fs.readFileSync(transcriptPath, "utf-8");
+    const lines = buf.split("\n").filter(Boolean);
+    const chunks = [];
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type !== "message") continue;
+        const msg = entry.message;
+        if (!msg || msg.role !== "assistant") continue;
+        const content = msg.content;
+        if (typeof content === "string" && content.trim()) {
+          chunks.push(content.trim());
+          continue;
+        }
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) {
+              chunks.push(block.text.trim());
+            }
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (chunks.length === 0) return null;
+    const combined = chunks.join("\n").trim();
+    return combined || null;
+  } catch {
+    return null;
+  }
+}
+
+export function readCompletionEvidence(task, acpSessionKey) {
+  const transcriptPath = resolveTranscriptPath(task?.streamLogPath);
+  const transcriptText = transcriptPath ? readProgressFromTranscript(transcriptPath) : null;
+  if (transcriptText) {
+    return {
+      summary: transcriptText,
+      hasMeaningfulOutput: true,
+      source: "transcript",
+    };
+  }
+
+  const streamText = readLatestProgress(acpSessionKey, task?.streamLogPath);
+  if (!streamText) {
+    return {
+      summary: "",
+      hasMeaningfulOutput: false,
+      source: "none",
+    };
+  }
+
+  return {
+    summary: streamText,
+    hasMeaningfulOutput: !isIgnorableSystemProgress(streamText),
+    source: isIgnorableSystemProgress(streamText) ? "system" : "stream",
+  };
+}
+
 export function classifyClosedAcpSession({
   spawnTs,
   now = Date.now(),
   lastUsed,
   created,
   progress,
+  hasMeaningfulOutput,
+  childSessionActive = false,
   minFailureAgeMs = SUSPECTED_FAILURE_GRACE_MS,
+  minChildSessionCompletionAgeMs = CHILD_SESSION_COMPLETION_GRACE_MS,
 }) {
   const taskAge = Math.max(0, now - spawnTs);
   const wasNeverUsed = Boolean(lastUsed && created && lastUsed === created);
   const tooShort = taskAge < 120_000;
-  const hasNoOutput = !progress || progress.length < 20;
-  const isSuspectedFailure = (wasNeverUsed || tooShort) && hasNoOutput;
+  const hasNoOutput = hasMeaningfulOutput === undefined
+    ? (!progress || progress.length < 20)
+    : !hasMeaningfulOutput;
+  const shouldDeferCompletion = childSessionActive && hasNoOutput && taskAge < minChildSessionCompletionAgeMs;
+  const isSuspectedFailure = !childSessionActive && (wasNeverUsed || tooShort) && hasNoOutput;
   const shouldDeferFailure = isSuspectedFailure && taskAge < minFailureAgeMs;
   const failureReason = isSuspectedFailure
     ? `suspected failure: wasNeverUsed=${wasNeverUsed}, tooShort=${tooShort}, hasNoOutput=${hasNoOutput}`
@@ -246,6 +332,7 @@ export function classifyClosedAcpSession({
     hasNoOutput,
     isSuspectedFailure,
     shouldDeferFailure,
+    shouldDeferCompletion,
     failureReason,
     finalStatus: isSuspectedFailure ? "failed" : "completed",
   };
@@ -650,14 +737,21 @@ function pollAcpSessions() {
         // Smart completion vs failure detection
         const lastUsed = sessionDetail?.last_used_at || sessionDetail?.lastUsedAt;
         const created = sessionDetail?.created_at || sessionDetail?.createdAt;
-        const progress = readLatestProgress(task.acpSessionKey || sessionName, task.streamLogPath);
+        const evidence = readCompletionEvidence(task, task.acpSessionKey || sessionName);
         const classification = classifyClosedAcpSession({
           spawnTs,
           now: Date.now(),
           lastUsed,
           created,
-          progress,
+          progress: evidence.summary,
+          hasMeaningfulOutput: evidence.hasMeaningfulOutput,
+          childSessionActive: Boolean(task.acpSessionKey || task.streamLogPath),
         });
+
+        if (classification.shouldDeferCompletion) {
+          pluginLogger?.info(`spawn-interceptor: ACP task ${taskId} deferring completion until child output appears (age=${Math.round(classification.taskAge / 1000)}s, session=${session.acpxRecordId})`);
+          continue;
+        }
 
         if (classification.shouldDeferFailure) {
           pluginLogger?.info(`spawn-interceptor: ACP task ${taskId} deferring suspected failure (age=${Math.round(classification.taskAge / 1000)}s, session=${session.acpxRecordId})`);
@@ -683,7 +777,7 @@ function pollAcpSessions() {
         });
         const summary = classification.isSuspectedFailure
           ? `❌ 任务可能未正常执行 (${classification.failureReason})`
-          : (progress || sessionName);
+          : (evidence.summary || sessionName);
         onTaskCompleted(task, classification.finalStatus, summary).catch(() => {});
 
         matched = true;
@@ -721,9 +815,13 @@ function pollAcpSessions() {
     if (!matched) {
       const age = Date.now() - spawnTs;
       if (age > BATCH_CLEANUP_AGE_MS && openSessions.length === 0) {
-        const progress = readLatestProgress(task.acpSessionKey, task.streamLogPath);
-        const hasNoOutput = !progress || progress.length < 20;
-        const finalStatus = hasNoOutput ? "failed" : "assumed_complete";
+        const evidence = readCompletionEvidence(task, task.acpSessionKey);
+        if ((task.acpSessionKey || task.streamLogPath) && !evidence.hasMeaningfulOutput && age < CHILD_SESSION_COMPLETION_GRACE_MS) {
+          pluginLogger?.info(`spawn-interceptor: ACP task ${taskId} keeping pending after parent close (age=${Math.round(age / 1000)}s, awaiting child output)`);
+          continue;
+        }
+
+        const finalStatus = evidence.hasMeaningfulOutput ? "assumed_complete" : "failed";
 
         pendingTasks.delete(taskId);
         appendLog({
@@ -737,11 +835,11 @@ function pollAcpSessions() {
           status: finalStatus,
           completedAt: new Date().toISOString(),
           completionSource: "acp_session_poller",
-          reason: `no open ACP sessions remain (task age: ${Math.round(age / 1000)}s, hasOutput=${!hasNoOutput})`,
+          reason: `no open ACP sessions remain (task age: ${Math.round(age / 1000)}s, hasOutput=${evidence.hasMeaningfulOutput})`,
         });
-        const summary = hasNoOutput
-          ? "❌ 任务可能未正常启动（无输出内容）"
-          : (progress || "");
+        const summary = evidence.hasMeaningfulOutput
+          ? (evidence.summary || "")
+          : "❌ 任务可能未正常启动（无输出内容）";
         onTaskCompleted(task, finalStatus, summary).catch(() => {});
         completed++;
         pluginLogger?.info(`spawn-interceptor: ACP task ${taskId} → ${finalStatus} (no open ACP sessions, age=${Math.round(age / 1000)}s)`);
