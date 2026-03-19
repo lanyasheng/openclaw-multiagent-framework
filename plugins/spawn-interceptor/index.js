@@ -1,25 +1,21 @@
 /**
- * spawn-interceptor v3.8.0 — OpenClaw plugin for ACP task tracking + notification.
+ * spawn-interceptor v3.9.0 — OpenClaw plugin for task lifecycle tracking.
  *
- * Based on v2.5.2 from github.com/lanyasheng/openclaw-multiagent-framework
+ * Supports multiple runtimes: subagent (primary), ACP (legacy), tmux (via subagent).
  *
- * Exec guard: prevents main session from exec-ing runner/claude (blocks session).
- * Completion detection (5-layer pipeline):
+ * Completion detection pipeline:
  *   L0. after_tool_call error — immediate spawn failure detection
  *   L1. subagent_ended hook — precise match by targetSessionKey
- *   L2. ACP session poller — smart completion vs failure heuristics
- *   L3. Stale reaper — marks tasks stuck > 30min as timeout
- *   L4. before_prompt_build — injects completion reports into parent turn
+ *   L1.5. reconcileSubagentRuns — periodic sync against runs.json (catches missed L1)
+ *   L2. ACP session poller — smart completion vs failure heuristics (legacy)
+ *   L3. Stale reaper — marks tasks stuck > 60min as timeout
+ *   L4. before_prompt_build — injects completion/stuck reports into parent turn
+ *   L5. Health check — detects stuck tasks (30-60min) with tmux awareness
  *
- * v3.8.0 changes:
- *   - EXEC GUARD: before_tool_call hook blocks main session from exec-ing runner/claude
- *   - TIMEOUT GUARD: auto-inject 30s timeout for find/du/rsync/wget in main session
- *
- * v3.7.0 changes:
- *   - sendWithRetry: exponential backoff retry for all Discord API calls
- *   - L0: detect ACP_SESSION_INIT_FAILED in after_tool_call immediately
- *   - L2 smart poller: distinguish real completions from GC-closed failures
- *   - Active parent wake via pluginRuntime.subagent.run() on task completion
+ * Guards:
+ *   - EXEC GUARD: blocks main session from exec-ing runner/claude
+ *   - TIMEOUT GUARD: auto-inject timeout for slow commands (disabled: triggers obfuscation-detected)
+ *   - IDEMPOTENCY GUARD: blocks duplicate task spawns
  */
 
 import fs from "fs";
@@ -29,12 +25,16 @@ import path from "path";
 const SHARED_CTX = path.join(os.homedir(), ".openclaw", "shared-context");
 const TASK_LOG = path.join(SHARED_CTX, "monitor-tasks", "task-log.jsonl");
 const PENDING_FILE = path.join(SHARED_CTX, "monitor-tasks", ".pending-tasks.json");
+const TASK_REGISTRY_FILE = path.join(SHARED_CTX, "monitor-tasks", "subagent-task-registry.json");
 const ACPX_SESSIONS_DIR = path.join(os.homedir(), ".acpx", "sessions");
 const ACPX_INDEX = path.join(ACPX_SESSIONS_DIR, "index.json");
 const GATEWAY_LOG = path.join(os.homedir(), ".openclaw", "logs", "gateway.log");
+const SUBAGENT_RUNS_FILE = path.join(os.homedir(), ".openclaw", "subagents", "runs.json");
+const TMUX_SOCKET_DIR = path.join(process.env.TMPDIR || "/tmp", "clawdbot-tmux-sockets");
+const TMUX_SOCKET = path.join(TMUX_SOCKET_DIR, "clawdbot.sock");
 const DEFAULT_COMPLETION_SESSION = "agent:main:completion-relay";
 
-const STALE_TIMEOUT_MS = 30 * 60 * 1000;
+const STALE_TIMEOUT_MS = 60 * 60 * 1000;
 const REAPER_INTERVAL_MS = 5 * 60 * 1000;
 const ACP_POLL_INTERVAL_MS = 15 * 1000;
 const PROGRESS_RELAY_INTERVAL_MS = 15 * 1000;
@@ -74,6 +74,73 @@ function savePending() {
   } catch { /* non-fatal */ }
 }
 
+
+function loadSubagentRuns() {
+  try {
+    if (!fs.existsSync(SUBAGENT_RUNS_FILE)) return {};
+    const data = JSON.parse(fs.readFileSync(SUBAGENT_RUNS_FILE, "utf-8"));
+    return data?.runs || {};
+  } catch {
+    return {};
+  }
+}
+
+function findSubagentRun(childSessionKey) {
+  if (!childSessionKey) return null;
+  const runs = loadSubagentRuns();
+  for (const run of Object.values(runs)) {
+    if (run.childSessionKey === childSessionKey) return run;
+  }
+  return null;
+}
+
+function listActiveTmuxSessions() {
+  try {
+    if (!fs.existsSync(TMUX_SOCKET)) return [];
+    const { execSync } = require("child_process");
+    const raw = execSync(`tmux -S "${TMUX_SOCKET}" list-sessions -F "#{session_name}" 2>/dev/null`, { timeout: 5000 }).toString().trim();
+    return raw ? raw.split("\n").filter(s => s.startsWith("cc-")) : [];
+  } catch {
+    return [];
+  }
+}
+
+function checkTmuxReportExists(label) {
+  const session = `cc-${label}`;
+  const reportJson = `/tmp/${session}-completion-report.json`;
+  return fs.existsSync(reportJson);
+}
+
+function getTmuxTaskEvidence(task) {
+  const tmuxSessions = listActiveTmuxSessions();
+  if (tmuxSessions.length === 0) {
+    return { hasTmux: false, anyAlive: false, reportExists: false };
+  }
+
+  const taskText = task.task || "";
+  let matchedSession = null;
+
+  // Try to match by label in task text
+  const labelMatch = taskText.match(/--label\s+["']?([\w-]+)/);
+  if (labelMatch) {
+    const sessionName = `cc-${labelMatch[1]}`;
+    if (tmuxSessions.includes(sessionName)) {
+      matchedSession = sessionName;
+    }
+  }
+
+  // Only match if we have a precise label match — avoid false association
+  if (!matchedSession) {
+    // No precise match: check if ANY cc-* report matches task timing
+    // but don't associate with a random session
+    return { hasTmux: false, anyAlive: tmuxSessions.length > 0, reportExists: false };
+  }
+
+  const label = matchedSession.replace(/^cc-/, "");
+  const reportExists = checkTmuxReportExists(label);
+  return { hasTmux: true, anyAlive: true, session: matchedSession, reportExists };
+}
+
 function genId() {
   const ts = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
   const r = Math.random().toString(36).slice(2, 8);
@@ -84,6 +151,138 @@ function appendLog(entry) {
   const dir = path.dirname(TASK_LOG);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.appendFileSync(TASK_LOG, JSON.stringify(entry) + "\n");
+}
+
+function ensureParentDir(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeJsonAtomic(filePath, payload) {
+  ensureParentDir(filePath);
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2));
+  fs.renameSync(tmp, filePath);
+}
+
+export function loadTaskRegistry(registryFile = TASK_REGISTRY_FILE) {
+  try {
+    if (!fs.existsSync(registryFile)) return {};
+    const parsed = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveTaskRegistry(registry, registryFile = TASK_REGISTRY_FILE) {
+  writeJsonAtomic(registryFile, registry || {});
+}
+
+export function terminalStatusToTaskState(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "completed" || normalized === "assumed_complete") return "completed";
+  if (normalized === "failed" || normalized === "timeout") return "failed";
+  return normalized || "failed";
+}
+
+export function nextCallbackStatus(currentStatus, stage, state) {
+  const normalizedState = String(state || "").trim().toLowerCase();
+  if (!["completed", "failed", "degraded"].includes(normalizedState)) {
+    throw new Error(`callback stage requires terminal task state, got ${state}`);
+  }
+
+  const transitions = {
+    pending: {
+      final_callback_sent: "sent",
+      final_callback_failed: "failed",
+    },
+    sent: {
+      callback_receipt_acked: "acked",
+    },
+  };
+
+  const next = transitions[String(currentStatus || "").trim().toLowerCase()]?.[stage];
+  if (!next) {
+    throw new Error(`illegal callback transition: ${currentStatus} --${stage}--> ?`);
+  }
+  return next;
+}
+
+export function patchTaskRegistry(taskId, mutator, registryFile = TASK_REGISTRY_FILE) {
+  if (!taskId) throw new Error("taskId is required");
+  const registry = loadTaskRegistry(registryFile);
+  const previous = registry[taskId] || null;
+  const next = mutator(previous ? JSON.parse(JSON.stringify(previous)) : null);
+  if (!next) throw new Error(`task registry mutator returned empty record for ${taskId}`);
+  registry[taskId] = next;
+  saveTaskRegistry(registry, registryFile);
+  return next;
+}
+
+export function recordTrackedTask(task, registryFile = TASK_REGISTRY_FILE) {
+  return patchTaskRegistry(task?.taskId, (previous) => ({
+    task_id: task?.taskId,
+    owner: task?.agentId || previous?.owner || "?",
+    runtime: task?.runtime || previous?.runtime || "subagent",
+    state: previous?.state || "queued",
+    evidence: {
+      ...(previous?.evidence || {}),
+      task: task?.task || previous?.evidence?.task || "",
+      requester_session_key: task?.requesterSessionKey || previous?.evidence?.requester_session_key || null,
+      spawned_at: task?.spawnedAt || previous?.evidence?.spawned_at || null,
+    },
+    callback_status: previous?.callback_status || "pending",
+  }), registryFile);
+}
+
+export function recordTaskTerminal(task, status, evidence = {}, registryFile = TASK_REGISTRY_FILE) {
+  const taskState = terminalStatusToTaskState(status);
+  return patchTaskRegistry(task?.taskId, (previous) => ({
+    task_id: task?.taskId,
+    owner: task?.agentId || previous?.owner || "?",
+    runtime: task?.runtime || previous?.runtime || "subagent",
+    state: taskState,
+    evidence: {
+      ...(previous?.evidence || {}),
+      ...(evidence || {}),
+      terminal_status: status,
+      completed_at: (evidence && evidence.completed_at) || new Date().toISOString(),
+    },
+    callback_status: previous?.callback_status || "pending",
+  }), registryFile);
+}
+
+export function recordTaskCallbackStage(taskId, stage, patch = {}, registryFile = TASK_REGISTRY_FILE) {
+  return patchTaskRegistry(taskId, (previous) => {
+    if (!previous) throw new Error(`task registry record not found for ${taskId}`);
+
+    const nextStatus = nextCallbackStatus(previous.callback_status || "pending", stage, previous.state);
+    const history = Array.isArray(previous.evidence?.callback?.history)
+      ? [...previous.evidence.callback.history]
+      : [];
+    history.push({
+      stage,
+      callback_status: nextStatus,
+      occurred_at: patch.occurred_at || new Date().toISOString(),
+      ...(patch || {}),
+    });
+
+    return {
+      ...previous,
+      evidence: {
+        ...(previous.evidence || {}),
+        callback: {
+          ...(previous.evidence?.callback || {}),
+          ...patch,
+          last_stage: stage,
+          last_updated_at: patch.occurred_at || new Date().toISOString(),
+          history,
+        },
+      },
+      callback_status: nextStatus,
+    };
+  }, registryFile);
 }
 
 function relay(taskId, requesterSessionKey) {
@@ -167,27 +366,8 @@ async function sendWithRetry(target, text, opts, maxRetries = 3) {
 
 // --- Notification helpers ---
 
-async function notifyDiscord(task, status, summary) {
-  const rawTarget = task.discordThreadId || task.discordChannelId;
-  if (!rawTarget) return;
-  const target = String(rawTarget).match(/^\d+$/) ? `channel:${rawTarget}` : String(rawTarget);
-
-  const emoji = status === "completed" ? "✅" : status === "timeout" ? "⏰" : status === "assumed_complete" ? "✅" : status === "failed" ? "❌" : "🔍";
-  const label = status === "completed" || status === "assumed_complete" ? "完成" : status === "failed" ? "失败" : "结束";
-  const taskDesc = (task.task || "").slice(0, 200);
-  const elapsed = task.spawnedAt
-    ? Math.round((Date.now() - new Date(task.spawnedAt).getTime()) / 1000)
-    : "?";
-  const summaryBlock = summary ? `\n📋 ${summary}` : "";
-  const text = `${emoji} **ACP 任务${label}** (${elapsed}s)\n> ${taskDesc}${summaryBlock}`;
-
-  const ok = await sendWithRetry(target, text, {
-    cfg: pluginConfig,
-    accountId: task.discordAccountId || undefined,
-  });
-  if (ok) {
-    pluginLogger?.info(`spawn-interceptor: Discord notify sent to ${target} for task ${task.taskId}`);
-  }
+async function notifyDiscord(_task, _status, _summary) {
+  // Disabled — completion delivery uses prompt injection (L4) + parent wake
 }
 
 export function getCompletionQueueKey(sessionKey, fallback = DEFAULT_COMPLETION_SESSION) {
@@ -200,6 +380,7 @@ export function enqueueCompletedTask(queueMap, task, status, completedAt = new D
   bucket.push({
     taskId: task?.taskId,
     status,
+    childSessionKey: task?.acpSessionKey || task?.spawnedSessionKey || null,
     task: (task?.task || "").slice(0, 100),
     completedAt,
   });
@@ -220,11 +401,28 @@ export function buildCompletionInjection(tasks) {
   if (!Array.isArray(tasks) || tasks.length === 0) return null;
 
   const lines = tasks.map(t => {
-    const s = t.status === "completed" ? "✅" : t.status === "timeout" ? "⏰" : "❌";
+    const s = t.status === "completed" || t.status === "assumed_complete" ? "✅"
+      : t.status === "timeout" ? "⏰"
+      : t.status === "possibly_stuck" ? "⚠️"
+      : "❌";
     return `${s} [${t.taskId}] ${t.task}`;
   });
 
-  return `\n\n[SYSTEM — ACP Task Completion Report]\nThe following ACP tasks have completed since your last turn:\n${lines.join("\n")}\n\nIf you have follow-up tasks to dispatch, please continue. Otherwise, report the results to the user.\n[END REPORT]`;
+  const hasTimeout = tasks.some(t => t.status === "timeout");
+  const hasCompleted = tasks.some(t => t.status === "completed" || t.status === "assumed_complete");
+  
+  let guidance = "If you have follow-up tasks to dispatch, please continue. Otherwise, report the results to the user.";
+  const hasStuck = tasks.some(t => t.status === "possibly_stuck");
+  if (hasTimeout || hasStuck) {
+    const rules = [];
+    if (hasStuck) rules.push("- ⚠️ tasks: POSSIBLY STUCK — task has been running for 60+ min with no progress. Notify user immediately and ask: investigate, cancel, or keep waiting?");
+    if (hasTimeout) rules.push("- ⏰ tasks: TIMED OUT — Report status to user. Do NOT auto-retry. Ask user whether to retry, skip, or investigate.");
+    if (hasCompleted) rules.push("- ✅ tasks: Process normally and continue workflow.");
+    rules.push("- If all tasks timed out/stuck and user is not active, just log status and wait.");
+    guidance = `TASK STATUS HANDLING RULES:\n${rules.join("\n")}`;
+  }
+  
+  return `\n\n[SYSTEM — ACP Task Completion Report]\nThe following ACP tasks have completed since your last turn:\n${lines.join("\n")}\n\n${guidance}\n[END REPORT]`;
 }
 
 export function isIgnorableSystemProgress(text) {
@@ -346,14 +544,33 @@ export function classifyClosedAcpSession({
 async function onTaskCompleted(task, status, summary) {
   await notifyDiscord(task, status, summary || "").catch(() => {});
 
-  const queueKey = enqueueCompletedTask(completedTasksSinceLastPrompt, task, status);
-  pluginLogger?.info(`spawn-interceptor: queued completion ${task.taskId} (status=${status}) for prompt injection, session=${queueKey}`);
+  try {
+    const queueKey = enqueueCompletedTask(completedTasksSinceLastPrompt, task, status);
+    pluginLogger?.info(`spawn-interceptor: queued completion ${task.taskId} (status=${status}) for prompt injection, session=${queueKey}`);
 
-  // Actively trigger parent agent's new turn to pick up prompt injection
-  const parentSessionKey = task.requesterSessionKey;
-  pluginLogger?.info(`spawn-interceptor: parent wake: parentKey=${parentSessionKey || "NONE"}`);
-  if (parentSessionKey) {
-    wakeParentSession(task, status, summary || "");
+    if (task?.runtime === "subagent") {
+      recordTaskCallbackStage(task.taskId, "final_callback_sent", {
+        summary: summary || "completion queued for parent delivery",
+        queue_key: queueKey,
+      });
+    }
+
+    // Actively trigger parent agent's new turn to pick up prompt injection
+    const parentSessionKey = task.requesterSessionKey;
+    pluginLogger?.info(`spawn-interceptor: parent wake: parentKey=${parentSessionKey || "NONE"}`);
+    if (parentSessionKey) {
+      wakeParentSession(task, status, summary || "");
+    }
+  } catch (err) {
+    if (task?.runtime === "subagent") {
+      try {
+        recordTaskCallbackStage(task.taskId, "final_callback_failed", {
+          summary: summary || "completion delivery failed",
+          error: err?.message || String(err),
+        });
+      } catch {}
+    }
+    throw err;
   }
 }
 
@@ -541,38 +758,31 @@ async function relayProgress() {
 
   loadPending();
 
-  const acpTasks = [...pendingTasks.entries()].filter(([, t]) => t.runtime === "acp");
-  if (acpTasks.length === 0) return;
+  const trackableTasks = [...pendingTasks.entries()].filter(([, t]) => t.runtime === "acp" || t.runtime === "subagent");
+  if (trackableTasks.length === 0) return;
 
-  pluginLogger?.info(`spawn-interceptor: relayProgress checking ${acpTasks.length} ACP task(s)`);
-
-  for (const [taskId, task] of acpTasks) {
+  for (const [taskId, task] of trackableTasks) {
     const rawTarget = task.discordThreadId || task.discordChannelId;
     if (!rawTarget) {
-      pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - no discord target`);
       continue;
     }
     const target = String(rawTarget).match(/^\d+$/) ? `channel:${rawTarget}` : String(rawTarget);
 
     const acpSessionId = task.acpSessionKey;
     if (!acpSessionId) {
-      pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - no acpSessionKey yet`);
       continue;
     }
 
     pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - reading progress for ${acpSessionId}, streamLog=${task.streamLogPath || "none"}`);
     const progress = readLatestProgress(acpSessionId, task.streamLogPath);
     if (!progress) {
-      pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - no progress found`);
       continue;
     }
 
-    const text = `🔄 **ACP 进度** (${taskId.slice(-8)})\n> ${progress.slice(0, 200)}`;
-    pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - sending to ${target}, len=${progress.length}`);
-    const ok = await sendWithRetry(target, text, {
-      cfg: pluginConfig,
-      accountId: task.discordAccountId || undefined,
-    }, 2);
+    // Progress relay to Discord — DISABLED
+    // const text = `🔄 **ACP 进度** (${taskId.slice(-8)})\n> ${progress.slice(0, 200)}`;
+    // Progress available but Discord relay disabled
+    const ok = false;
     if (ok) {
       pluginLogger?.info(`spawn-interceptor: relayProgress ${taskId} - sent OK`);
     }
@@ -581,6 +791,221 @@ async function relayProgress() {
 
 // --- Stale reaper ---
 
+
+const HEALTH_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 min
+let healthCheckTimer = null;
+
+function healthCheckPendingTasks() {
+  if (pendingTasks.size === 0) return;
+  
+  const now = Date.now();
+  const warnings = [];
+  
+  for (const [taskId, task] of pendingTasks.entries()) {
+    const ageMs = now - new Date(task.spawnedAt).getTime();
+    const ageMin = Math.round(ageMs / 60000);
+    
+    // Warning thresholds
+    if (ageMin >= 30 && ageMin < 60) {
+      // Task running for 60-120 min — check for signs of life
+      // For subagent runtime: check runs.json + tmux evidence
+      let hasProgress = false;
+      if (task.runtime === "subagent" || task.acpSessionKey?.includes(":subagent:")) {
+        const run = findSubagentRun(task.acpSessionKey);
+        if (run?.endedAt) {
+          continue; // Already ended, reconcile will handle it
+        }
+        if (run && !run.endedAt && run.startedAt) {
+          // Check tmux for deeper insight
+          const tmux = getTmuxTaskEvidence(task);
+          if (tmux.hasTmux) {
+            if (tmux.reportExists) {
+              hasProgress = true; // tmux report exists, task likely done
+            } else if (tmux.anyAlive) {
+              hasProgress = true; // tmux session alive, still working
+            } else {
+              hasProgress = false; // tmux dead, no report — stuck
+              pluginLogger?.info(`spawn-interceptor: health — ${taskId} subagent running but tmux dead/no-report, marking as stuck`);
+            }
+          } else {
+            hasProgress = true; // No tmux at all — pure subagent, treat as active
+          }
+        }
+      } else {
+        const progress = readLatestProgress(task.acpSessionKey, task.streamLogPath);
+        hasProgress = progress && progress.length > 20;
+      }
+      if (!hasProgress) {
+        warnings.push({
+          taskId,
+          ageMin,
+          status: "possibly_stuck",
+          message: `Task ${taskId} has been pending for ${ageMin}min with no progress. May be stuck.`,
+        });
+      }
+    } else if (ageMin >= 60) {
+      // Will be reaped by stale_reaper, no need to warn separately
+    }
+  }
+  
+  if (warnings.length > 0) {
+    // Write health warnings to a file for observability
+    const warningPath = path.join(SHARED_CTX, "monitor-tasks", "health-warnings.json");
+    try {
+      const payload = {
+        timestamp: new Date().toISOString(),
+        pendingCount: pendingTasks.size,
+        warnings,
+      };
+      writeJsonAtomic(warningPath, payload);
+      pluginLogger?.info(`spawn-interceptor: health check found ${warnings.length} warning(s), written to ${warningPath}`);
+    } catch {}
+    
+    // Actively inject stuck warning into parent session's next prompt
+    for (const w of warnings) {
+      const task = [...pendingTasks.values()].find(t => t.taskId === w.taskId);
+      if (task?.requesterSessionKey) {
+        const queueKey = getCompletionQueueKey(task.requesterSessionKey);
+        const bucket = completedTasksSinceLastPrompt.get(queueKey) || [];
+        // Only inject if not already warned for this task
+        const alreadyWarned = bucket.some(b => b.taskId === w.taskId && b.status === "possibly_stuck");
+        if (!alreadyWarned) {
+          bucket.push({
+            taskId: w.taskId,
+            status: "possibly_stuck",
+            task: (task.task || "").slice(0, 200),
+            completedAt: new Date().toISOString(),
+          });
+          completedTasksSinceLastPrompt.set(queueKey, bucket);
+          pluginLogger?.info(`spawn-interceptor: queued stuck warning for ${w.taskId} into prompt injection queue`);
+        }
+      }
+    }
+  }
+}
+
+
+function isRunnerStillActive(task) {
+  // For subagent runtime: check runs.json + tmux session status
+  if (task.runtime === "subagent" || task.acpSessionKey?.includes(":subagent:")) {
+    const run = findSubagentRun(task.acpSessionKey);
+    if (!run) return false;
+    if (run.endedAt) return false;
+    if (run.startedAt) {
+      // Subagent is running — also check if it has a tmux task that's still alive
+      const ageMs = Date.now() - run.startedAt;
+      if (ageMs > 20 * 60 * 1000) {
+        // For long-running subagents, check tmux evidence
+        const tmux = getTmuxTaskEvidence(task);
+        if (tmux.hasTmux && !tmux.anyAlive && !tmux.reportExists) {
+          pluginLogger?.info(`spawn-interceptor: subagent ${task.taskId} running for ${Math.round(ageMs / 60000)}min but tmux session is dead with no report — not truly active`);
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // Legacy ACP runtime: check status.json
+  try {
+    const runDir = task.runDir || task.streamLogPath?.replace(/\/[^/]+$/, "");
+    if (!runDir) return false;
+    const statusPath = path.join(runDir, "status.json");
+    if (!fs.existsSync(statusPath)) return false;
+    const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+    const state = status.state || "";
+    if (state === "running" || state === "started") {
+      const heartbeat = status.heartbeatAt || status.lastActivity;
+      if (heartbeat) {
+        const hbAge = Date.now() - new Date(heartbeat).getTime();
+        return hbAge < 10 * 60 * 1000;
+      }
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+
+function reconcileSubagentRuns() {
+  const subagentPending = [...pendingTasks.entries()].filter(
+    ([, t]) => t.runtime === "subagent" || t.acpSessionKey?.includes(":subagent:")
+  );
+  if (subagentPending.length === 0) return;
+
+  const runs = loadSubagentRuns();
+  const runsByChildKey = new Map();
+  for (const run of Object.values(runs)) {
+    if (run.childSessionKey) runsByChildKey.set(run.childSessionKey, run);
+  }
+  let reconciled = 0;
+
+  for (const [taskId, task] of subagentPending) {
+    const childKey = task.acpSessionKey;
+    if (!childKey) continue;
+
+    const run = runsByChildKey.get(childKey) || null;
+    if (!run) {
+      // No run record — if task is old enough, it was likely from a previous gateway session
+      const age = Date.now() - new Date(task.spawnedAt).getTime();
+      if (age > 30 * 60 * 1000) {
+        pluginLogger?.info(`spawn-interceptor: reconcile — ${taskId} has no run record and is ${Math.round(age / 60000)}min old, marking as lost`);
+        pendingTasks.delete(taskId);
+        appendLog({
+          taskId, agentId: task.agentId, sessionKey: task.sessionKey,
+          requesterSessionKey: task.requesterSessionKey,
+          runtime: task.runtime, task: task.task, spawnedAt: task.spawnedAt,
+          status: "failed", completedAt: new Date().toISOString(),
+          completionSource: "reconcile_no_run",
+          reason: "no matching run record found in subagents/runs.json",
+        });
+        onTaskCompleted(task, "failed", "Task lost — no run record found (possibly pre-restart)").catch(() => {});
+        reconciled++;
+      }
+      continue;
+    }
+
+    if (run.endedAt) {
+      // Run already ended but pending task wasn't cleaned up (subagent_ended hook missed)
+      const outcome = run.outcome;
+      const status = (outcome?.status === "ok" || run.endedReason === "subagent-complete") ? "completed" : "failed";
+      const summary = run.frozenResultText ? String(run.frozenResultText).slice(0, 500) : "";
+
+      pluginLogger?.info(`spawn-interceptor: reconcile — ${taskId} run already ended (outcome=${JSON.stringify(outcome)}, reason=${run.endedReason}), marking as ${status}`);
+      pendingTasks.delete(taskId);
+      appendLog({
+        taskId, agentId: task.agentId, sessionKey: task.sessionKey,
+        requesterSessionKey: task.requesterSessionKey,
+        runtime: task.runtime, task: task.task, spawnedAt: task.spawnedAt,
+        status, completedAt: new Date(run.endedAt).toISOString(),
+        completionSource: "reconcile_runs_json",
+        reason: `run ended: ${run.endedReason || "unknown"}`,
+        outcome: JSON.stringify(outcome),
+      });
+      if (task.runtime === "subagent") {
+        try {
+          recordTaskTerminal(task, status, {
+            completion_source: "reconcile_runs_json",
+            completed_at: new Date(run.endedAt).toISOString(),
+            reason: run.endedReason || "unknown",
+            child_session_key: childKey,
+          });
+        } catch {}
+      }
+      onTaskCompleted(task, status, summary).catch(() => {});
+      reconciled++;
+    }
+  }
+
+  if (reconciled > 0) {
+    savePending();
+    pluginLogger?.info(`spawn-interceptor: reconciled ${reconciled} subagent task(s), ${pendingTasks.size} still pending`);
+  }
+}
+
 function reapStaleTasks() {
   const now = Date.now();
   let reaped = 0;
@@ -588,7 +1013,22 @@ function reapStaleTasks() {
   for (const [taskId, task] of [...pendingTasks.entries()]) {
     const spawnedAt = new Date(task.spawnedAt).getTime();
     if (now - spawnedAt > STALE_TIMEOUT_MS) {
+      // P1a: Check runner status.json before reaping — task may still be running
+      if (isRunnerStillActive(task)) {
+        pluginLogger?.info(`spawn-interceptor: ${taskId} past stale timeout but runner still active, skipping reap`);
+        continue;
+      }
       const progress = readLatestProgress(task.acpSessionKey, task.streamLogPath);
+      const taskAgeMin = Math.round((now - spawnedAt) / 60000);
+      
+      // Classify timeout type for better downstream handling
+      let timeoutType = "stale_no_signal";
+      let timeoutAction = "timeout";
+      if (progress && progress.length > 50) {
+        timeoutType = "stale_had_progress";
+        timeoutAction = "timeout";
+      }
+      
       pendingTasks.delete(taskId);
       appendLog({
         taskId,
@@ -598,12 +1038,13 @@ function reapStaleTasks() {
         runtime: task.runtime,
         task: task.task,
         spawnedAt: task.spawnedAt,
-        status: "timeout",
+        status: timeoutAction,
         completedAt: new Date().toISOString(),
         completionSource: "stale_reaper",
-        reason: `no completion detected within ${STALE_TIMEOUT_MS / 60000}min`,
+        timeoutType,
+        reason: `no completion detected within ${taskAgeMin}min (type=${timeoutType})`,
       });
-      onTaskCompleted(task, "timeout", progress || "").catch(() => {});
+      onTaskCompleted(task, timeoutAction, progress ? `[Last progress] ${progress.slice(0, 300)}` : "No progress detected").catch(() => {});
       reaped++;
     }
   }
@@ -614,6 +1055,38 @@ function reapStaleTasks() {
   }
 
   cleanupAcpxZombies();
+  gcConsumedSessionIds();
+  rotateTaskLog();
+}
+
+function gcConsumedSessionIds() {
+  if (consumedAcpSessionIds.size > 500) {
+    const excess = consumedAcpSessionIds.size - 200;
+    const iter = consumedAcpSessionIds.values();
+    for (let i = 0; i < excess; i++) {
+      consumedAcpSessionIds.delete(iter.next().value);
+    }
+    pluginLogger?.info(`spawn-interceptor: GC'd ${excess} consumed ACP session IDs, ${consumedAcpSessionIds.size} remaining`);
+  }
+}
+
+const MAX_TASK_LOG_BYTES = 2 * 1024 * 1024; // 2MB
+let lastLogRotateCheck = 0;
+
+function rotateTaskLog() {
+  const now = Date.now();
+  if (now - lastLogRotateCheck < 60 * 60 * 1000) return; // Check at most once per hour
+  lastLogRotateCheck = now;
+
+  try {
+    if (!fs.existsSync(TASK_LOG)) return;
+    const stat = fs.statSync(TASK_LOG);
+    if (stat.size > MAX_TASK_LOG_BYTES) {
+      const archivePath = TASK_LOG + `.${new Date().toISOString().slice(0, 10)}.bak`;
+      fs.renameSync(TASK_LOG, archivePath);
+      pluginLogger?.info(`spawn-interceptor: rotated task-log (${Math.round(stat.size / 1024)}KB) → ${archivePath}`);
+    }
+  } catch {}
 }
 
 // --- ACPX zombie cleanup ---
@@ -864,27 +1337,30 @@ const spawnInterceptorPlugin = {
   id: "spawn-interceptor",
   name: "Spawn Interceptor",
   description: "ACP task tracking with completion notification and progress relay",
-  version: "3.7.0",
+  version: "3.9.0",
 
   register(api) {
     pluginLogger = api.logger;
     pluginRuntime = api.runtime;
     pluginConfig = api.config;
 
-    api.logger.info("spawn-interceptor v3.8.0: registering (retry + L0 spawn failure + smart poller + parent wake + progress relay)");
+    api.logger.info("spawn-interceptor v3.9.0: registering (runs.json + tmux awareness + reconcile + health check)");
 
     loadPending();
     if (pendingTasks.size > 0) {
       api.logger.info(`spawn-interceptor: restored ${pendingTasks.size} pending task(s) from disk`);
+      reconcileSubagentRuns();
       reapStaleTasks();
       pollAcpSessions();
     }
 
     if (reaperTimer) { clearInterval(reaperTimer); reaperTimer = null; }
+    if (healthCheckTimer) { clearInterval(healthCheckTimer); healthCheckTimer = null; }
     if (acpPollerTimer) { clearInterval(acpPollerTimer); acpPollerTimer = null; }
     if (progressRelayTimer) { clearInterval(progressRelayTimer); progressRelayTimer = null; }
 
-    reaperTimer = setInterval(reapStaleTasks, REAPER_INTERVAL_MS);
+    reaperTimer = setInterval(() => { reconcileSubagentRuns(); reapStaleTasks(); }, REAPER_INTERVAL_MS);
+    healthCheckTimer = setInterval(healthCheckPendingTasks, HEALTH_CHECK_INTERVAL_MS);
     acpPollerTimer = setInterval(pollAcpSessions, ACP_POLL_INTERVAL_MS);
     progressRelayTimer = setInterval(() => relayProgress().catch(() => {}), PROGRESS_RELAY_INTERVAL_MS);
 
@@ -895,6 +1371,20 @@ const spawnInterceptorPlugin = {
 
       const injection = buildCompletionInjection(tasks);
       if (!injection) return;
+
+      const registry = loadTaskRegistry();
+      for (const task of tasks) {
+        const runtime = registry?.[task.taskId]?.runtime;
+        if (runtime !== "subagent") continue;
+        try {
+          recordTaskCallbackStage(task.taskId, "callback_receipt_acked", {
+            summary: "completion injected into parent prompt",
+            receipt_session_key: ctx.sessionKey || null,
+          });
+        } catch (err) {
+          api.logger.warn(`spawn-interceptor: callback ack patch failed for ${task.taskId}: ${err?.message || err}`);
+        }
+      }
 
       api.logger.info(`spawn-interceptor: injected ${tasks.length} completed task(s) into prompt for ${getCompletionQueueKey(ctx.sessionKey)}`);
       return { prependContext: injection };
@@ -940,43 +1430,10 @@ const spawnInterceptorPlugin = {
       };
     });
 
-    // Hook 0.6: before_tool_call — TIMEOUT GUARD: auto-inject timeout for potentially slow commands in main session
-    api.on("before_tool_call", (event, ctx) => {
-      if (event.toolName !== "exec") return;
-
-      const sessionKey = ctx.sessionKey || "";
-      if (!sessionKey.startsWith("agent:main:")) return;
-
-      const command = (event.params?.command || "").trim();
-
-      // Commands that can run indefinitely without user realizing
-      const slowCommandPatterns = [
-        /^find\s/,           // find without timeout
-        /^find$/,            // bare find
-        /find\s+\//,       // find with absolute path
-        /^du\s+-.*[^0-9]\//, // du on root-level paths
-        /^tar\s.*czf/,       // tar creating large archives
-        /^rsync\s/,          // rsync large transfers
-        /^wget\s/,           // wget large downloads
-        /^curl.*-o\s/,       // curl downloading files
-      ];
-
-      const needsTimeout = slowCommandPatterns.some(p => p.test(command));
-      if (!needsTimeout) return;
-
-      // Skip if already has timeout prefix
-      if (/^timeout\s/.test(command)) return;
-      // Skip if piped or chained (complex commands, user likely knows what they're doing)
-      if (/[|;&]/.test(command) && !/^find\s/.test(command)) return;
-
-      const TIMEOUT_SECS = 30;
-      // macOS has no `timeout` command; use perl one-liner as cross-platform wrapper
-      const escaped = command.replace(/'/g, "'\\''");
-      const newCommand = `perl -e 'alarm ${TIMEOUT_SECS}; exec @ARGV or die "exec: $!"' -- sh -c '${escaped}'`;
-      api.logger.info(`spawn-interceptor: TIMEOUT GUARD injected ${TIMEOUT_SECS}s timeout for slow command in main session: ${command.slice(0, 80)}`);
-
-      return { params: { ...event.params, command: newCommand } };
-    });
+    // Hook 0.6: TIMEOUT GUARD — DISABLED
+    // Previously injected `perl -e 'alarm ...'` wrapper around slow commands,
+    // but OpenClaw's security system flags this as obfuscation-detected and rejects it.
+    // Slow command timeout is now the agent's responsibility via prompt guidance.
 
     // Hook 1: before_tool_call — inject relay + parse Discord origin from sessionKey
     api.on("before_tool_call", (event, ctx) => {
@@ -1000,22 +1457,32 @@ const spawnInterceptorPlugin = {
         requesterSessionKey: ctx.sessionKey || null,
       };
 
+      // Idempotency guard — block before tracking to avoid orphan entries
+      const taskHash = String(p.task || "").slice(0, 100).trim();
+      if (taskHash) {
+        for (const [existingId, existingTask] of pendingTasks.entries()) {
+          const existingHash = String(existingTask.task || "").slice(0, 100).trim();
+          const existingAge = Date.now() - new Date(existingTask.spawnedAt).getTime();
+          if (existingHash === taskHash && existingAge < STALE_TIMEOUT_MS && existingTask.status === "spawning") {
+            pluginLogger?.info(`spawn-interceptor: IDEMPOTENCY GUARD — duplicate task detected: ${id} matches existing ${existingId} (age=${Math.round(existingAge/1000)}s)`);
+            return {
+              block: true,
+              blockReason: `Duplicate task blocked: identical task ${existingId} is already pending (spawned ${Math.round(existingAge/60000)}min ago). Wait for it to complete or timeout before retrying.`,
+            };
+          }
+        }
+      }
+
       appendLog(taskEntry);
       pendingTasks.set(id, taskEntry);
       savePending();
+      if (rt === "subagent") {
+        recordTrackedTask(taskEntry);
+      }
 
       api.logger.info(`spawn-interceptor: tracked ${id} (runtime=${rt}, discord=${discordChannelId || "none"}, pending=${pendingTasks.size})`);
 
-      // Immediate start notification to Discord
-      if (rt === "acp" && discordChannelId) {
-        const target = `channel:${discordChannelId}`;
-        const taskDesc = String(p.task || "").slice(0, 150);
-        sendWithRetry(target, `🚀 **ACP 任务开始** (${id.slice(-8)})\n> ${taskDesc}`, {
-          cfg: pluginConfig,
-        }, 2).then(ok => {
-          if (ok) api.logger.info(`spawn-interceptor: start notify sent for ${id}`);
-        }).catch(() => {});
-      }
+
 
       if (rt === "acp" && p.task) {
         const nextParams = { ...p, task: p.task + relay(id, ctx.sessionKey) }; if (nextParams.streamTo == null) nextParams.streamTo = "parent"; return { params: nextParams };
@@ -1216,6 +1683,19 @@ const spawnInterceptorPlugin = {
           outcome,
           targetSessionKey: targetKey,
         });
+        if (matchedTask.runtime === "subagent") {
+          try {
+            recordTaskTerminal(matchedTask, completionStatus, {
+              completion_source: "subagent_ended_hook",
+              completed_at: endedAt,
+              reason,
+              outcome,
+              child_session_key: targetKey || matchedTask.spawnedSessionKey || null,
+            });
+          } catch (err) {
+            api.logger.warn(`spawn-interceptor: terminal patch failed for ${matchedTaskId}: ${err?.message || err}`);
+          }
+        }
         onTaskCompleted(matchedTask, completionStatus).catch(() => {});
         api.logger.info(`spawn-interceptor: ${matchedTaskId} → ${completionStatus} (subagent_ended, pending=${pendingTasks.size})`);
       } else {
@@ -1233,11 +1713,12 @@ const spawnInterceptorPlugin = {
       }
     });
 
-    api.logger.info(`spawn-interceptor v3.8.0: all hooks registered. Poller=${ACP_POLL_INTERVAL_MS / 1000}s, Progress=${PROGRESS_RELAY_INTERVAL_MS / 1000}s, ZombieCleanup=every ${REAPER_INTERVAL_MS / 1000}s`);
+    api.logger.info(`spawn-interceptor v3.9.0: all hooks registered. Poller=${ACP_POLL_INTERVAL_MS / 1000}s, Progress=${PROGRESS_RELAY_INTERVAL_MS / 1000}s, ZombieCleanup=every ${REAPER_INTERVAL_MS / 1000}s`);
   },
 
   unregister() {
     if (reaperTimer) { clearInterval(reaperTimer); reaperTimer = null; }
+    if (healthCheckTimer) { clearInterval(healthCheckTimer); healthCheckTimer = null; }
     if (acpPollerTimer) { clearInterval(acpPollerTimer); acpPollerTimer = null; }
     if (progressRelayTimer) { clearInterval(progressRelayTimer); progressRelayTimer = null; }
     consumedAcpSessionIds.clear();
