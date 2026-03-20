@@ -11,14 +11,20 @@ import os from "os";
 import path from "path";
 import {
   buildCompletionInjection,
+  buildWakeParentCliCommand,
   classifyClosedAcpSession,
   consumeCompletedTasksForSession,
+  deriveBatchIdFromTask,
   enqueueCompletedTask,
+  findPendingTaskForSubagentEnded,
   findStreamFileForSessionEntries,
   getCompletionQueueKey,
   isIgnorableSystemProgress,
+  markJobStatusTaskCompletedFromSubagent,
+  parseExplicitAgentSessionId,
   readCompletionEvidence,
   readProgressFromTranscript as actualReadProgressFromTranscript,
+  registerJobStatusTaskForSubagent,
   resolveTranscriptPath as actualResolveTranscriptPath,
 } from "./index.js";
 
@@ -1006,6 +1012,115 @@ test("readCompletionEvidence prefers transcript assistant output when available"
   assert.strictEqual(evidence.hasMeaningfulOutput, true);
   assert.strictEqual(evidence.source, "transcript");
   assert.ok(evidence.summary.includes("final report written"));
+});
+
+// === runtime bridge / job-status adapter ===
+
+console.log("── runtime bridge / job-status adapter ──");
+
+test("parseExplicitAgentSessionId accepts explicit ids and rejects requester session keys", () => {
+  assert.strictEqual(parseExplicitAgentSessionId("1234"), "1234");
+  assert.strictEqual(
+    parseExplicitAgentSessionId("550e8400-e29b-41d4-a716-446655440000"),
+    "550e8400-e29b-41d4-a716-446655440000",
+  );
+  assert.strictEqual(
+    parseExplicitAgentSessionId("agent:main:discord:channel:1475430870318846048"),
+    null,
+  );
+  assert.strictEqual(
+    buildWakeParentCliCommand("agent:main:discord:channel:1475430870318846048", "done"),
+    null,
+  );
+});
+
+test("findPendingTaskForSubagentEnded matches exact child session key only", () => {
+  const entries = new Map([
+    ["tsk_exact", { runtime: "subagent", acpSessionKey: "agent:main:subagent:child-1" }],
+    ["tsk_other", { runtime: "subagent", acpSessionKey: "agent:main:subagent:child-2" }],
+  ]);
+
+  assert.deepStrictEqual(
+    findPendingTaskForSubagentEnded(entries.entries(), "agent:main:subagent:child-2"),
+    {
+      taskId: "tsk_other",
+      task: { runtime: "subagent", acpSessionKey: "agent:main:subagent:child-2" },
+    },
+  );
+  assert.strictEqual(
+    findPendingTaskForSubagentEnded(entries.entries(), "agent:main:subagent:missing"),
+    null,
+  );
+});
+
+test("findPendingTaskForSubagentEnded also honors spawnedSessionKey without fallback", () => {
+  const entries = new Map([
+    ["tsk_only", { runtime: "subagent", spawnedSessionKey: "agent:main:subagent:child-9" }],
+  ]);
+
+  assert.deepStrictEqual(
+    findPendingTaskForSubagentEnded(entries.entries(), "agent:main:subagent:child-9"),
+    {
+      taskId: "tsk_only",
+      task: { runtime: "subagent", spawnedSessionKey: "agent:main:subagent:child-9" },
+    },
+  );
+  assert.strictEqual(
+    findPendingTaskForSubagentEnded(entries.entries(), "agent:main:subagent:other"),
+    null,
+  );
+});
+
+test("registerJobStatusTaskForSubagent creates pending orchestrator state", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "spawn-interceptor-job-status-"));
+  const task = {
+    taskId: "tsk_jobstatus_001",
+    agentId: "main",
+    runtime: "subagent",
+    task: "thin integration test",
+    requesterSessionKey: "agent:main:discord:channel:123",
+    spawnedAt: "2026-03-19T09:00:00.000Z",
+  };
+
+  registerJobStatusTaskForSubagent(task, { stateDir, timeoutSeconds: 120 });
+  const filePath = path.join(stateDir, `${task.taskId}.json`);
+  assert.ok(fs.existsSync(filePath));
+
+  const state = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  assert.strictEqual(state.task_id, task.taskId);
+  assert.strictEqual(state.state, "pending");
+  assert.strictEqual(state.timeout_seconds, 120);
+  assert.strictEqual(state.batch_id, deriveBatchIdFromTask(task));
+  assert.strictEqual(state.metadata.runtime, "subagent");
+  assert.strictEqual(state.metadata.requester_session_key, task.requesterSessionKey);
+});
+
+test("markJobStatusTaskCompletedFromSubagent transitions to callback_received and stores result", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "spawn-interceptor-job-status-complete-"));
+  const task = {
+    taskId: "tsk_jobstatus_002",
+    agentId: "main",
+    runtime: "subagent",
+    task: "thin integration test",
+    requesterSessionKey: "agent:main:discord:channel:123",
+    spawnedAt: "2026-03-19T09:00:00.000Z",
+  };
+
+  registerJobStatusTaskForSubagent(task, { stateDir, timeoutSeconds: 60 });
+  markJobStatusTaskCompletedFromSubagent(
+    task,
+    "completed",
+    { result: { verdict: "PASS" } },
+    { stateDir, orchestratorCliPath: "/nonexistent/orchestrator/cli.py" },
+  );
+
+  const filePath = path.join(stateDir, `${task.taskId}.json`);
+  const state = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  assert.strictEqual(state.task_id, task.taskId);
+  assert.strictEqual(state.state, "callback_received");
+  assert.ok(state.callback_received_at);
+  assert.ok(state.completed_at);
+  assert.strictEqual(state.result.verdict, "PASS");
 });
 
 // ─── Summary ───

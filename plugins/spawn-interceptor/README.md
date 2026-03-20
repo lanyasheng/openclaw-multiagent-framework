@@ -1,6 +1,6 @@
 # spawn-interceptor
 
-> Zero-config OpenClaw plugin for **multi-runtime** task lifecycle management. Tracks spawns across `subagent` and legacy `ACP` runtimes, detects completion/failure/stuck states, implements safety guards (idempotency, stale reaper), reconciles with `runs.json` and `tmux` sessions, and actively wakes parent agents — without any agent-side code changes.
+> Zero-config OpenClaw plugin for **multi-runtime** task lifecycle management. Tracks spawns across `subagent` and legacy `ACP` runtimes, detects completion/failure/stuck states, implements safety guards (idempotency, stale reaper), reconciles with `runs.json` and `tmux` sessions, actively wakes parent agents, and now bridges subagent terminal states into orchestrator-friendly `job-status/` artifacts — without any agent-side code changes.
 
 ## The Problem
 
@@ -18,7 +18,7 @@ Result: agents dispatch tasks into a black hole with zero visibility, duplicate 
 ## Architecture
 
 ```
-┌─────────────── spawn-interceptor v3.9.0 ────────────────┐
+┌─────────────── spawn-interceptor v3.10.0 ───────────────┐
 │                                                          │
 │  HOOKS (system-level interception)                       │
 │  ┌────────────────────────────────────────────────────┐  │
@@ -53,6 +53,7 @@ Result: agents dispatch tasks into a black hole with zero visibility, duplicate 
 │  ┌────────────────────────────────────────────────────┐  │
 │  │ subagent.run(parentSessionKey) → wake parent       │  │
 │  │ prompt injection → completion + status rules       │  │
+│  │ job-status patch → batch-summary/decide bridge     │  │
 │  │ Emoji: ✅ success │ ❌ fail │ ⏰ timeout │ ⚠️ stuck │  │
 │  └────────────────────────────────────────────────────┘  │
 │                                                          │
@@ -61,12 +62,13 @@ Result: agents dispatch tasks into a black hole with zero visibility, duplicate 
 │  │ task-log.jsonl       → append-only audit log       │  │
 │  │ .pending-tasks.json  → survives gateway restart    │  │
 │  │ subagent-task-registry.json → lifecycle tracking   │  │
+│  │ job-status/{taskId}.json → orchestrator bridge     │  │
 │  │ health-warnings.json → stuck task alerts           │  │
 │  └────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────┘
 ```
 
-## Key Features (v3.9.0)
+## Key Features (v3.10.0)
 
 ### Idempotency Guard
 Before tracking a new spawn, checks if an identical task (first 100 chars) is already pending. If a match exists and hasn't timed out, the spawn is **blocked** with a `Duplicate task blocked` message. This prevents the #1 production issue: parent agents re-dispatching the same task due to perceived inactivity.
@@ -102,6 +104,21 @@ Runs every 10 minutes. For pending tasks aged 30-60 minutes with no progress:
 ### Task Log Rotation
 Auto-archives `task-log.jsonl` when it exceeds 2MB, checked hourly.
 
+### Subagent → Orchestrator Runtime Bridge
+For `runtime="subagent"`, the plugin now writes a companion state file at spawn time and updates it on terminal events:
+
+- **Spawn hook**: `registerJobStatusTaskForSubagent()` creates `shared-context/job-status/{taskId}.json`
+- **Terminal hook**: `subagent_ended` and `reconcileSubagentRuns()` call `markJobStatusTaskCompletedFromSubagent()`
+- **Batch grouping**: `batch_id` is derived from explicit `batchId` or fallback `requesterSessionKey`
+- **Post-terminal fan-out**: opportunistically runs `orchestrator/cli.py batch-summary <batch_id>` and `decide <batch_id>`
+
+This bridge is intentionally **decision-only** in v1:
+
+- it refreshes task state and batch-level artifacts
+- it allows the orchestrator to materialize a `dispatch-plan` / next-step decision
+- it **does not auto-spawn the next round** from the plugin
+- retry / follow-up / dispatch execution remains the orchestrator or human owner's responsibility
+
 ## Design Decisions
 
 ### Why plugin hooks instead of wrapper functions?
@@ -116,6 +133,12 @@ Earlier versions tracked the task first, then checked for duplicates. If blocked
 ### Why auto-inject stuck warnings?
 `before_prompt_build` is passive — only fires on new turns. Without active injection via `completedTasksSinceLastPrompt`, stuck tasks would go unnoticed until someone manually checks.
 
+### Why only wake parent via explicit session IDs?
+A requester session key like `agent:main:discord:channel:...` is **not** the same thing as an agent session id accepted by `openclaw agent --session-id`. The bridge now refuses to synthesize CLI wake commands unless the value is an explicit numeric/UUID session id, preventing accidental delivery to the wrong surface.
+
+### Why decision-only instead of auto-dispatch?
+The plugin can reliably observe lifecycle transitions, but it does **not** own workflow policy. Auto-spawning the next batch inside the hook would couple runtime observation with orchestration policy and make retries harder to reason about. v1 therefore stops at `batch-summary` + `decide`, leaving actual dispatch to the orchestrator.
+
 ### Why 60-minute stale timeout?
 - 30min (v3.6): Too aggressive — complex coding tasks routinely take 40-50min. 11% false-positive timeout rate.
 - 120min: Too long — genuinely stuck tasks waste resources.
@@ -125,6 +148,7 @@ Earlier versions tracked the task first, then checked for duplicates. If blocked
 
 | Version | Key Changes |
 |---------|-------------|
+| **v3.10.0** | **Runtime bridge v1**: subagent lifecycle now patches `job-status/{taskId}.json`, derives `batch_id`, and opportunistically runs `batch-summary` + `decide`. **Exact subagent matching** via `spawnedSessionKey`/`targetSessionKey`. **Safe parent wake** only when CLI gets an explicit session id. **Still no auto-dispatch** from the plugin. |
 | **v3.9.0** | **Multi-runtime**: subagent + tmux + ACP support. **Idempotency guard** (position fix). **Health check poller** with auto-inject. **Reconciliation** via runs.json. **GC** for session IDs. **Log rotation**. Dead code cleanup. Version unification. |
 | **v3.8.0** | Stale timeout 30min→60min. Runner liveness check. Completion report includes childSessionKey. Timeout classification. |
 | **v3.6.0** | Failure detection. Active parent wake via `subagent.run()`. Spawn error detection. |
@@ -159,12 +183,14 @@ ln -s $(pwd)/plugins/spawn-interceptor ~/.openclaw/plugins/spawn-interceptor
 | `task-log.jsonl` | `~/.openclaw/shared-context/monitor-tasks/` | Append-only audit log of all task events |
 | `.pending-tasks.json` | Same directory | Active pending tasks, survives restart |
 | `subagent-task-registry.json` | Same directory | Lifecycle + callback tracking for subagent tasks |
+| `job-status/{taskId}.json` | `~/.openclaw/shared-context/job-status/` | Orchestrator-facing task state bridge for subagent tasks |
 | `health-warnings.json` | Same directory | Current stuck task warnings |
 
 ## Known Limitations
 
 - **Single-host only**: File system polling requires co-located processes
 - **tmux label matching**: Only detects tmux tasks with explicit `--label` in task prompt
+- **Decision-only bridge**: Plugin updates task state and batch artifacts, but does not auto-dispatch next tasks
 - **No auto-retry**: Detects and reports failures/timeouts, does not retry. Retry is orchestrator's responsibility
 - **ACP deprecated**: ACP runtime support retained for backward compatibility but not actively tested
 

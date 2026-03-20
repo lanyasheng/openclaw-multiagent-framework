@@ -1,8 +1,8 @@
 {
   "name": "spawn-interceptor",
-  "version": "3.7.0",
+  "version": "3.10.0",
   "type": "module",
-  "description": "Task tracking with adaptive progress relay, transcript fallback, and full Discord completion reports",
+  "description": "Task lifecycle tracking with multi-runtime reconciliation and subagent-to-orchestrator runtime bridge",
   "main": "index.js",
   "keywords": [
     "openclaw",

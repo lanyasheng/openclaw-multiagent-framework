@@ -61,7 +61,7 @@
 ```
 shared-context/
 ├── AGENT_PROTOCOL.md      # 统一协作协议（唯一真值）
-├── job-status/            # 任务状态追踪
+├── job-status/            # 任务状态追踪（含 subagent→orchestrator bridge）
 ├── monitor-tasks/         # task-log.jsonl（plugin 自动写入）
 ├── agent-outputs/         # Agent 输出产物（L4 证据来源）
 ├── dispatches/            # 派单记录
@@ -107,6 +107,21 @@ sessions_spawn(
 - Hook 记录任务启动（spawning）
 - Hook 不检测任务完成
 - 完成检测由 L3/L4 负责
+
+### Layer 2.5: subagent → orchestrator runtime bridge（v1）
+
+**目标**：把 runtime 观察到的 subagent 生命周期，桥接成 orchestrator 可消费的 `job-status/` 真值文件与 batch 级决策输入。
+
+**当前实现**：
+- spawn 时创建 `shared-context/job-status/{taskId}.json`
+- subagent 终态（`subagent_ended` / `reconcileSubagentRuns()`）回写 `state/result/completed_at`
+- `batch_id` 优先取显式 `batchId`，否则从 `requesterSessionKey` 派生
+- 终态后机会式触发 `batch-summary` 与 `decide`
+
+**当前边界**：
+- 只落 **task state / batch summary / decision**
+- 可以生成 orchestrator 的 `dispatch-plan` 输入
+- **不自动 spawn 下一轮**，后续派发仍由 orchestrator / 人类 owner 决策
 
 ### Layer 3: 基础终态层 (Poller + Reaper)
 

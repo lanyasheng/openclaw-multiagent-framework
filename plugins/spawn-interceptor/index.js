@@ -33,6 +33,16 @@ const SUBAGENT_RUNS_FILE = path.join(os.homedir(), ".openclaw", "subagents", "ru
 const TMUX_SOCKET_DIR = path.join(process.env.TMPDIR || "/tmp", "clawdbot-tmux-sockets");
 const TMUX_SOCKET = path.join(TMUX_SOCKET_DIR, "clawdbot.sock");
 const DEFAULT_COMPLETION_SESSION = "agent:main:completion-relay";
+const DEFAULT_STATE_DIR = process.env.OPENCLAW_STATE_DIR
+  ? path.resolve(process.env.OPENCLAW_STATE_DIR)
+  : path.join(SHARED_CTX, "job-status");
+const ORCHESTRATOR_CLI_PATH = path.join(
+  os.homedir(),
+  ".openclaw",
+  "workspace",
+  "orchestrator",
+  "cli.py",
+);
 
 const STALE_TIMEOUT_MS = 60 * 60 * 1000;
 const REAPER_INTERVAL_MS = 5 * 60 * 1000;
@@ -285,6 +295,216 @@ export function recordTaskCallbackStage(taskId, stage, patch = {}, registryFile 
   }, registryFile);
 }
 
+function resolveJobStatusTaskPath(taskId, stateDir = DEFAULT_STATE_DIR) {
+  if (!taskId) return null;
+  return path.join(stateDir, `${taskId}.json`);
+}
+
+function isoNow() {
+  return new Date().toISOString();
+}
+
+export function deriveBatchIdFromTask(task) {
+  const raw =
+    (task && (task.batchId || task.batch_id || task.requesterSessionKey)) ||
+    "default";
+  const base = String(raw || "default");
+  const trimmed = base.replace(/^agent:/, "").trim() || "default";
+  const slug = trimmed.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80);
+  return slug || "default";
+}
+
+export function registerJobStatusTaskForSubagent(task, options = {}) {
+  try {
+    const stateDir = options.stateDir || DEFAULT_STATE_DIR;
+    const taskId = task?.taskId;
+    if (!taskId) return;
+    const filePath = resolveJobStatusTaskPath(taskId, stateDir);
+    if (!filePath) return;
+
+    let existing = null;
+    if (fs.existsSync(filePath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      } catch {
+        existing = null;
+      }
+    }
+
+    const batchId =
+      options.batchId ||
+      existing?.batch_id ||
+      deriveBatchIdFromTask({
+        batchId: existing?.batch_id,
+        requesterSessionKey: task?.requesterSessionKey,
+      });
+
+    const metadata = {
+      ...(existing?.metadata || {}),
+      runtime: task?.runtime || existing?.metadata?.runtime || "subagent",
+      owner: task?.agentId || existing?.metadata?.owner || "main",
+      requester_session_key:
+        task?.requesterSessionKey ||
+        existing?.metadata?.requester_session_key ||
+        null,
+    };
+
+    const dispatchedAt =
+      task?.spawnedAt || existing?.dispatched_at || isoNow();
+    const timeoutSeconds =
+      typeof options.timeoutSeconds === "number" && options.timeoutSeconds > 0
+        ? options.timeoutSeconds
+        : typeof existing?.timeout_seconds === "number"
+          ? existing.timeout_seconds
+          : 3600;
+
+    const payload =
+      existing && typeof existing === "object"
+        ? {
+            ...existing,
+            batch_id: batchId,
+            dispatched_at: existing.dispatched_at || dispatchedAt,
+            timeout_seconds: timeoutSeconds,
+            metadata,
+          }
+        : {
+            task_id: taskId,
+            batch_id: batchId,
+            state: "pending",
+            dispatched_at: dispatchedAt,
+            callback_received_at: null,
+            completed_at: null,
+            result: null,
+            next_task_ids: [],
+            retry_count: 0,
+            timeout_seconds: timeoutSeconds,
+            metadata,
+          };
+
+    writeJsonAtomic(filePath, payload);
+  } catch (err) {
+    pluginLogger?.warn?.(
+      `spawn-interceptor: failed to register orchestrator task ${task?.taskId}: ${err?.message || err}`,
+    );
+  }
+}
+
+function orchestratorCliExists(cliPath = ORCHESTRATOR_CLI_PATH) {
+  try {
+    return Boolean(cliPath && fs.existsSync(cliPath));
+  } catch {
+    return false;
+  }
+}
+
+function maybeUpdateBatchArtifacts(batchId, options = {}) {
+  const cliPath = options.orchestratorCliPath || ORCHESTRATOR_CLI_PATH;
+  if (!batchId || !cliPath || !orchestratorCliExists(cliPath)) {
+    return;
+  }
+  try {
+    const { execFile } = require("child_process");
+    const env = { ...process.env };
+    const timeoutMs = options.timeoutMs || 30000;
+    execFile(
+      "python3",
+      [cliPath, "batch-summary", String(batchId)],
+      { timeout: timeoutMs, env },
+      (err) => {
+        if (err) {
+          pluginLogger?.info?.(
+            `spawn-interceptor: orchestrator batch-summary(${batchId}) exited non-zero: ${err?.message || err}`,
+          );
+        }
+      },
+    );
+    execFile(
+      "python3",
+      [cliPath, "decide", String(batchId)],
+      { timeout: timeoutMs, env },
+      (err) => {
+        if (err) {
+          // Decisions are opportunistic; log at info level when no decision is ready.
+          pluginLogger?.info?.(
+            `spawn-interceptor: orchestrator decide(${batchId}) exited non-zero: ${err?.message || err}`,
+          );
+        }
+      },
+    );
+  } catch (err) {
+    pluginLogger?.warn?.(
+      `spawn-interceptor: orchestrator CLI invocation failed for batch ${batchId}: ${err?.message || err}`,
+    );
+  }
+}
+
+export function markJobStatusTaskCompletedFromSubagent(
+  task,
+  terminalStatus,
+  details = {},
+  options = {},
+) {
+  try {
+    const stateDir = options.stateDir || DEFAULT_STATE_DIR;
+    const taskId = task?.taskId;
+    if (!taskId) return;
+    const filePath = resolveJobStatusTaskPath(taskId, stateDir);
+    if (!fs.existsSync(filePath)) {
+      registerJobStatusTaskForSubagent(task, { stateDir });
+    }
+
+    let state;
+    try {
+      state = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    } catch {
+      state = null;
+    }
+    if (!state || typeof state !== "object") {
+      return;
+    }
+
+    const now = isoNow();
+    const result = {
+      ...(state.result || {}),
+      ...(details.result || {}),
+    };
+    const normalized = String(terminalStatus || "").toLowerCase();
+    let nextState = "failed";
+    if (normalized === "completed" || normalized === "assumed_complete") {
+      nextState = "callback_received";
+    } else if (normalized === "timeout") {
+      nextState = "timeout";
+    }
+
+    state.state = nextState;
+    state.result = result;
+    state.callback_received_at = state.callback_received_at || now;
+    if (!state.completed_at || nextState === "timeout" || nextState === "failed") {
+      state.completed_at = now;
+    }
+    if (!state.batch_id) {
+      state.batch_id = deriveBatchIdFromTask({
+        batchId: state.batch_id,
+        requesterSessionKey: task?.requesterSessionKey,
+      });
+    }
+    state.metadata = {
+      ...(state.metadata || {}),
+      ...(details.metadata || {}),
+    };
+
+    writeJsonAtomic(filePath, state);
+    maybeUpdateBatchArtifacts(state.batch_id, {
+      orchestratorCliPath: options.orchestratorCliPath,
+      timeoutMs: options.timeoutMs,
+    });
+  } catch (err) {
+    pluginLogger?.warn?.(
+      `spawn-interceptor: failed to mark orchestrator task ${task?.taskId} as ${terminalStatus}: ${err?.message || err}`,
+    );
+  }
+}
+
 function relay(taskId, requesterSessionKey) {
   const relayTarget = requesterSessionKey || DEFAULT_COMPLETION_SESSION;
   return `\n\n---\n[COMPLETION RELAY — OPTIONAL]\nWhen done, call sessions_send with:\n  sessionKey: "${relayTarget}"\n  message: {"type":"acp_completion","taskId":"${taskId}","status":"completed or failed","summary":"one-sentence result"}\nThis is optional — completion is tracked automatically.\n---`;
@@ -294,6 +514,30 @@ function parseDiscordChannelFromSessionKey(sessionKey) {
   if (!sessionKey) return null;
   const m = sessionKey.match(/discord:channel:(\d+)/);
   return m ? m[1] : null;
+}
+
+export function parseExplicitAgentSessionId(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  if (/^\d+$/.test(trimmed)) return trimmed;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  return null;
+}
+
+export function buildWakeParentCliCommand(parentSessionKey, msg) {
+  const sessionId = parseExplicitAgentSessionId(parentSessionKey);
+  if (!sessionId) return null;
+
+  const escapedMsg = String(msg || "").replace(/'/g, "'\\''");
+  const channelId = parseDiscordChannelFromSessionKey(parentSessionKey);
+  const channelArg = channelId ? `--to 'channel:${channelId}' --channel discord` : "--channel discord";
+
+  return `export PATH="/opt/homebrew/bin:$HOME/.npm-global/bin:$PATH"; openclaw agent --session-id '${sessionId}' --message '${escapedMsg}' --deliver ${channelArg} 2>&1`;
 }
 
 function extractChildSessionKey(result) {
@@ -340,6 +584,21 @@ function extractStreamLogPath(result) {
     }
   }
   return result.streamLogPath || null;
+}
+
+export function findPendingTaskForSubagentEnded(entries, targetSessionKey) {
+  if (!targetSessionKey || !entries) return null;
+
+  for (const [taskId, task] of entries) {
+    if (task?.acpSessionKey === targetSessionKey) {
+      return { taskId, task };
+    }
+    if (task?.runtime === "subagent" && task?.spawnedSessionKey === targetSessionKey) {
+      return { taskId, task };
+    }
+  }
+
+  return null;
 }
 
 // --- Retry wrapper for Discord API calls ---
@@ -600,18 +859,23 @@ async function wakeParentSession(task, status, summary) {
   }
 
   // Strategy 2: openclaw agent CLI with --session-id (works outside request context)
-  // Resolve the correct Discord channel from parentSessionKey to avoid routing to the default channel.
+  // SAFETY: requesterSessionKey is not the same thing as an agent session id.
+  // Only use the CLI path when we can reliably derive an explicit session id.
+  const cmd = buildWakeParentCliCommand(parentSessionKey, msg);
+  if (!cmd) {
+    pluginLogger?.warn(`spawn-interceptor: skipping CLI parent wake for ${task.taskId} because requesterSessionKey is not a reliable --session-id: ${parentSessionKey}`);
+    return;
+  }
+
   try {
     const { exec } = require("child_process");
-    const escapedMsg = msg.replace(/'/g, "'\\''");
+    const sessionId = parseExplicitAgentSessionId(parentSessionKey);
     const channelId = parseDiscordChannelFromSessionKey(parentSessionKey);
-    const channelArg = channelId ? `--to 'channel:${channelId}' --channel discord` : "--channel discord";
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.npm-global/bin:$PATH"; openclaw agent --session-id '${parentSessionKey}' --message '${escapedMsg}' --deliver ${channelArg} 2>&1`;
     exec(cmd, { timeout: 60000, env: { ...process.env, PATH: "/opt/homebrew/bin:" + (process.env.HOME || "") + "/.npm-global/bin:" + (process.env.PATH || "") } }, (err, stdout) => {
       if (err) {
         pluginLogger?.warn(`spawn-interceptor: CLI parent wake failed: ${err.message}${stdout ? " stdout=" + stdout.slice(0, 200) : ""}`);
       } else {
-        pluginLogger?.info(`spawn-interceptor: woke parent via CLI (sessionId=${parentSessionKey}, channel=${channelId || "default"})`);
+        pluginLogger?.info(`spawn-interceptor: woke parent via CLI (sessionId=${sessionId}, channel=${channelId || "default"})`);
       }
     });
   } catch (err) {
@@ -994,6 +1258,28 @@ function reconcileSubagentRuns() {
             child_session_key: childKey,
           });
         } catch {}
+        try {
+          markJobStatusTaskCompletedFromSubagent(
+            task,
+            status,
+            {
+              result: {
+                status,
+                outcome: outcome?.status,
+                error: typeof outcome?.error === "string" ? outcome.error : undefined,
+                reason: run.endedReason || "unknown",
+                child_session_key: childKey,
+              },
+              metadata: {
+                requester_session_key: task.requesterSessionKey || null,
+              },
+            },
+          );
+        } catch (err) {
+          pluginLogger?.warn?.(
+            `spawn-interceptor: orchestrator reconcile patch failed for ${taskId}: ${err?.message || err}`,
+          );
+        }
       }
       onTaskCompleted(task, status, summary).catch(() => {});
       reconciled++;
@@ -1478,6 +1764,7 @@ const spawnInterceptorPlugin = {
       savePending();
       if (rt === "subagent") {
         recordTrackedTask(taskEntry);
+        registerJobStatusTaskForSubagent(taskEntry);
       }
 
       api.logger.info(`spawn-interceptor: tracked ${id} (runtime=${rt}, discord=${discordChannelId || "none"}, pending=${pendingTasks.size})`);
@@ -1499,6 +1786,7 @@ const spawnInterceptorPlugin = {
         discordThreadId: requester.threadId ? String(requester.threadId) : null,
         discordAccountId: requester.accountId || null,
         acpSessionKey: childKey,
+        spawnedSessionKey: childKey,
       };
 
       if (requester.to && !origin.discordThreadId) {
@@ -1515,6 +1803,9 @@ const spawnInterceptorPlugin = {
         if (origin.discordThreadId) merged.discordThreadId = origin.discordThreadId;
         if (origin.discordAccountId) merged.discordAccountId = origin.discordAccountId;
         if (origin.acpSessionKey) merged.acpSessionKey = origin.acpSessionKey;
+        if (merged.runtime === "subagent" && origin.spawnedSessionKey) {
+          merged.spawnedSessionKey = origin.spawnedSessionKey;
+        }
         if (origin.discordChannelId && !merged.discordChannelId) {
           merged.discordChannelId = origin.discordChannelId;
         }
@@ -1542,6 +1833,7 @@ const spawnInterceptorPlugin = {
         if (age > 60000) continue;
 
         task.acpSessionKey = childKey;
+        if (task.runtime === "subagent") task.spawnedSessionKey = childKey;
         if (event.runId) task.acpRunId = event.runId;
         if (ctx.requesterSessionKey && !task.requesterSessionKey) {
           task.requesterSessionKey = ctx.requesterSessionKey;
@@ -1604,6 +1896,7 @@ const spawnInterceptorPlugin = {
 
       function linkTask(task, taskId, method) {
         task.acpSessionKey = childSessionKey;
+        if (task.runtime === "subagent") task.spawnedSessionKey = childSessionKey;
         if (streamLogPath) task.streamLogPath = streamLogPath;
         pendingTasks.set(taskId, task);
         savePending();
@@ -1637,33 +1930,18 @@ const spawnInterceptorPlugin = {
       const outcome = event.outcome || "";
       const endedAt = new Date().toISOString();
 
-      let matchedTaskId = null;
-      let matchedTask = null;
+      const matched = findPendingTaskForSubagentEnded(pendingTasks.entries(), targetKey);
+      let matchedTaskId = matched?.taskId || null;
+      let matchedTask = matched?.task || null;
 
-      for (const [taskId, task] of pendingTasks.entries()) {
-        if (targetKey && task.acpSessionKey === targetKey) {
-          matchedTaskId = taskId;
-          matchedTask = task;
-          break;
-        }
-        if (task.runtime === "subagent" && targetKey && task.spawnedSessionKey === targetKey) {
-          matchedTaskId = taskId;
-          matchedTask = task;
-          break;
-        }
-      }
-
-      if (!matchedTaskId) {
-        const subagentTasks = [...pendingTasks.entries()].filter(
-          ([, t]) => t.runtime === "subagent",
-        );
-        if (subagentTasks.length === 1) {
-          [matchedTaskId, matchedTask] = subagentTasks[0];
-        }
-      }
-
+      const outcomeStatus =
+        typeof outcome === "string" ? outcome : String(outcome || "");
       const completionStatus =
-        outcome === "ok" || reason === "subagent-complete" ? "completed" : "failed";
+        outcomeStatus === "ok" || reason === "subagent-complete"
+          ? "completed"
+          : outcomeStatus === "timeout"
+            ? "timeout"
+            : "failed";
 
       if (matchedTaskId && matchedTask) {
         pendingTasks.delete(matchedTaskId);
@@ -1694,6 +1972,27 @@ const spawnInterceptorPlugin = {
             });
           } catch (err) {
             api.logger.warn(`spawn-interceptor: terminal patch failed for ${matchedTaskId}: ${err?.message || err}`);
+          }
+          try {
+            markJobStatusTaskCompletedFromSubagent(
+              matchedTask,
+              completionStatus,
+              {
+                result: {
+                  status: completionStatus,
+                  outcome: outcomeStatus,
+                  reason,
+                  child_session_key: targetKey || matchedTask.spawnedSessionKey || null,
+                },
+                metadata: {
+                  requester_session_key: matchedTask.requesterSessionKey || null,
+                },
+              },
+            );
+          } catch (err) {
+            api.logger.warn(
+              `spawn-interceptor: orchestrator patch failed for ${matchedTaskId}: ${err?.message || err}`,
+            );
           }
         }
         onTaskCompleted(matchedTask, completionStatus).catch(() => {});

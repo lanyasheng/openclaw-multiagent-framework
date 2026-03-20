@@ -1,6 +1,23 @@
 # Release Notes
 
 ---
+## v2.6.0 — subagent ↔ orchestrator runtime bridge v1 (2026-03-20)
+
+### 核心变化
+
+- **subagent 生命周期桥接**：`spawn-interceptor` 在 `runtime=subagent` 的 `before_tool_call` 阶段同步创建 `shared-context/job-status/{taskId}.json`
+- **终态写回**：`subagent_ended` 与 `reconcileSubagentRuns()` 都会把 completed / failed / timeout 写回对应 job-status 文件
+- **batch 聚合**：`batch_id` 优先取显式 `batchId`，否则从 `requesterSessionKey` 派生，便于 batch summary / decision 聚合
+- **decision-only v1**：终态后机会式调用 `orchestrator/cli.py batch-summary <batch_id>` 与 `decide <batch_id>`，**只产出 decision / dispatch-plan，不自动 spawn 下一轮**
+- **精确匹配修正**：`subagent_ended` 改为严格按 `targetSessionKey` / `spawnedSessionKey` 匹配 pending task，去掉单 pending fallback
+- **父会话唤醒安全修正**：CLI 唤醒仅接受显式 session id（数字/UUID），不再把 `agent:main:discord:channel:*` 这类 requester session key 当作 `--session-id`
+
+### 对外意义
+
+- 公开仓现在包含一份可执行的 engine 侧适配：runtime 观察层可以直接为 orchestrator 生成 task state 与 batch-level decision 输入
+- 当前策略仍保持克制：plugin 只负责**状态桥接与决策触发**，不在 hook 内内联业务编排
+
+---
 ## v2.5.2 — spawn-interceptor 可靠性强化 + 上游 ACP 修复 (2026-03-14)
 
 ### 上游修复
